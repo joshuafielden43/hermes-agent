@@ -663,6 +663,7 @@ def _create_app(adapter: APIServerAdapter) -> web.Application:
     app.router.add_get("/v1/toolsets", adapter._handle_toolsets)
     app.router.add_post("/v1/chat/completions", adapter._handle_chat_completions)
     app.router.add_post("/v1/responses", adapter._handle_responses)
+    app.router.add_post("/v1/runs", adapter._handle_runs)
     app.router.add_get("/v1/responses/{response_id}", adapter._handle_get_response)
     app.router.add_delete("/v1/responses/{response_id}", adapter._handle_delete_response)
     app.router.add_post(
@@ -4515,7 +4516,7 @@ class TestModelRoutesHandlers:
                 }
 
     @pytest.mark.asyncio
-    async def test_chat_completions_no_route_for_unknown_model(self):
+    async def test_chat_completions_rejects_unknown_model(self):
         adapter = _make_routing_adapter({"minimax-m2": {"model": "minimax/minimax-m1"}})
         app = _create_app(adapter)
         async with TestClient(TestServer(app)) as cli:
@@ -4528,8 +4529,9 @@ class TestModelRoutesHandlers:
                     "model": "unknown-model",
                     "messages": [{"role": "user", "content": "hello"}],
                 })
-                assert resp.status == 200
-                assert mock_run.call_args.kwargs.get("route") is None
+                assert resp.status == 400
+                assert (await resp.json())["error"]["code"] == "invalid_model"
+                mock_run.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_responses_api_passes_route_to_run_agent(self):
@@ -4550,6 +4552,19 @@ class TestModelRoutesHandlers:
                 assert mock_run.call_args.kwargs.get("route") == {
                     "model": "minimax/minimax-m1", "provider": "openrouter",
                 }
+
+    @pytest.mark.asyncio
+    async def test_responses_and_runs_reject_unknown_model(self):
+        adapter = _make_routing_adapter({"known": {"model": "provider/model"}})
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            for path, payload in (
+                ("/v1/responses", {"model": "unknown", "input": "hello"}),
+                ("/v1/runs", {"model": "unknown", "input": "hello"}),
+            ):
+                resp = await cli.post(path, json=payload)
+                assert resp.status == 400
+                assert (await resp.json())["error"]["code"] == "invalid_model"
 
 
 class TestModelRoutesAgentCreation:
@@ -4626,8 +4641,8 @@ class TestModelRoutesAgentCreation:
         assert captured["model"] == "global/model"
         assert captured["api_key"] == "sk-global"
 
-    def test_session_model_override_beats_route(self, monkeypatch):
-        """A user-issued /model on the session must win over static route config."""
+    def test_explicit_route_beats_session_model_override(self, monkeypatch):
+        """An explicit HTTP model must win over a prior session /model command."""
         captured = {}
 
         class FakeAgent:
@@ -4645,10 +4660,8 @@ class TestModelRoutesAgentCreation:
 
         adapter._create_agent(session_id="s1", route=adapter._resolve_route("alias"))
 
-        # The route must NOT be applied — the session override path (global
-        # runtime here, since the gateway applies /model separately) wins.
-        assert captured["model"] == "global/model"
-        assert captured["api_key"] == "sk-global"
+        assert captured["model"] == "route/model"
+        assert captured["api_key"] == "sk-route"
 
     def test_session_override_lookup_reads_gateway_runner(self, monkeypatch):
         """_session_model_override_for consults GatewayRunner._session_model_overrides."""

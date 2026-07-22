@@ -1798,6 +1798,23 @@ class APIServerAdapter(BasePlatformAdapter):
             return None
         return self._model_routes.get(model_alias)
 
+    def _route_for_request(self, model: Any) -> tuple[Optional[Dict[str, Any]], Optional["web.Response"]]:
+        """Resolve an explicit API model against the configured allowlist."""
+        if model is None:
+            return None, None
+        if not isinstance(model, str) or not model.strip():
+            return None, web.json_response(
+                _openai_error("'model' must be a configured model ID", code="invalid_model"), status=400
+            )
+        if model == self._model_name:
+            return None, None
+        route = self._resolve_route(model)
+        if route is not None:
+            return route, None
+        return None, web.json_response(
+            _openai_error(f"Unknown model: {model}", code="invalid_model"), status=400
+        )
+
     def _session_model_override_for(self, session_key: Optional[str]) -> Optional[Dict[str, Any]]:
         """Return the gateway's session ``/model`` override for *session_key*, if any.
 
@@ -1877,15 +1894,12 @@ class APIServerAdapter(BasePlatformAdapter):
         if runtime_model:
             model = runtime_model
 
-        # Per-client model routing (model_routes config).  The route was
-        # resolved from the request's ``model`` field by the HTTP handler.
-        # Precedence (highest first): session ``/model`` override → model_routes
-        # route → global config — an explicit user-issued ``/model`` on the
-        # session always beats static per-client route config.
+        # Per-client model routing (model_routes config). An explicit HTTP
+        # model selection wins over a prior gateway-session /model command.
         session_override = self._session_model_override_for(
             gateway_session_key or session_id
         )
-        if route and not session_override:
+        if route:
             if route.get("provider"):
                 # Resolve real credentials for the routed provider (mirrors
                 # the channel_overrides path in gateway/run.py) so a route
@@ -1916,11 +1930,8 @@ class APIServerAdapter(BasePlatformAdapter):
                 model,
                 runtime_kwargs.get("provider"),
             )
-        elif route and session_override:
-            logger.debug(
-                "api_server model route skipped: session /model override wins for %s",
-                gateway_session_key or session_id,
-            )
+        elif session_override:
+            logger.debug("api_server session /model override active for %s", gateway_session_key or session_id)
 
         user_config = _load_gateway_config()
         enabled_toolsets = sorted(_get_platform_tools(user_config, "api_server"))
@@ -2860,7 +2871,9 @@ class APIServerAdapter(BasePlatformAdapter):
         # Per-client model routing: if the requested model matches a
         # configured model_routes alias, this request's agent is created
         # with that route's model/provider instead of the global default.
-        route = self._resolve_route(model_name)
+        route, route_error = self._route_for_request(body.get("model"))
+        if route_error is not None:
+            return route_error
 
         if stream:
             import queue as _q
@@ -3980,7 +3993,9 @@ class APIServerAdapter(BasePlatformAdapter):
         session_id = stored_session_id or str(uuid.uuid4())
 
         # Per-client model routing for /v1/responses (see model_routes).
-        route = self._resolve_route(body.get("model"))
+        route, route_error = self._route_for_request(body.get("model"))
+        if route_error is not None:
+            return route_error
 
         stream = _coerce_request_bool(body.get("stream"), default=False)
         if stream:
@@ -5022,7 +5037,9 @@ class APIServerAdapter(BasePlatformAdapter):
         )
 
         # Per-client model routing for /v1/runs (see model_routes).
-        route = self._resolve_route(body.get("model"))
+        route, route_error = self._route_for_request(body.get("model"))
+        if route_error is not None:
+            return route_error
         # Background task outlives the HTTP response (and thus the middleware
         # profile scope). Capture now and re-enter inside the task/executor.
         request_profile = _api_request_profile.get()
