@@ -4697,6 +4697,24 @@ class TestModelRoutesHandlers:
 
 
 class TestModelRoutesAgentCreation:
+    def test_strict_output_disables_fallback(self, monkeypatch):
+        captured = {}
+
+        class FakeAgent:
+            def __init__(self, **kwargs):
+                captured.update(kwargs)
+                self.request_overrides = kwargs.get("request_overrides", {})
+
+        _patch_create_agent_runtime(monkeypatch, captured, FakeAgent)
+        monkeypatch.setattr(
+            "gateway.run.GatewayRunner._load_fallback_model", staticmethod(lambda: {"model": "fallback/model"})
+        )
+        adapter = _make_routing_adapter({})
+        monkeypatch.setattr(adapter, "_ensure_session_db", lambda: None)
+        adapter._create_agent(output_contract={"strict": True, "provider_format": {"type": "json_schema"}})
+
+        assert captured["fallback_model"] is None
+
     def test_output_contract_is_forwarded_to_provider(self, monkeypatch):
         captured = {}
 
@@ -4711,6 +4729,24 @@ class TestModelRoutesAgentCreation:
         agent = adapter._create_agent(output_contract={"provider_format": {"type": "json_object"}})
 
         assert agent.request_overrides["extra_body"]["response_format"] == {"type": "json_object"}
+
+    def test_output_contract_uses_responses_text_format(self, monkeypatch):
+        captured = {}
+
+        class FakeAgent:
+            def __init__(self, **kwargs):
+                captured.update(kwargs)
+                self.request_overrides = kwargs.get("request_overrides", {})
+
+        _patch_create_agent_runtime(monkeypatch, captured, FakeAgent)
+        monkeypatch.setattr("gateway.run._resolve_runtime_agent_kwargs", lambda: {"provider": "xai", "api_mode": "codex_responses"})
+        adapter = _make_routing_adapter({})
+        monkeypatch.setattr(adapter, "_ensure_session_db", lambda: None)
+        agent = adapter._create_agent(output_contract={
+            "provider_format": {"type": "json_object"}, "responses_format": {"type": "json_object"},
+        })
+
+        assert agent.request_overrides["text"] == {"format": {"type": "json_object"}}
 
     def test_route_overrides_model_and_credentials(self, monkeypatch):
         captured = {}

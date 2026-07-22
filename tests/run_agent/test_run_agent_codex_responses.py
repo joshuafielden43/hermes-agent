@@ -1752,6 +1752,35 @@ def test_preflight_codex_api_kwargs_allows_service_tier(monkeypatch):
     assert result["service_tier"] == "priority"
 
 
+def test_preflight_codex_api_kwargs_allows_text_format(monkeypatch):
+    _build_agent(monkeypatch)
+    kwargs = _codex_request_kwargs()
+    kwargs["text"] = {
+        "format": {
+            "type": "json_schema",
+            "name": "answer",
+            "schema": {"type": "object"},
+            "strict": True,
+        }
+    }
+
+    from agent.codex_responses_adapter import _preflight_codex_api_kwargs
+
+    result = _preflight_codex_api_kwargs(kwargs)
+    assert result["text"] == kwargs["text"]
+
+
+def test_preflight_codex_api_kwargs_rejects_non_object_text(monkeypatch):
+    _build_agent(monkeypatch)
+    kwargs = _codex_request_kwargs()
+    kwargs["text"] = "json"
+
+    from agent.codex_responses_adapter import _preflight_codex_api_kwargs
+
+    with pytest.raises(ValueError, match="'text' must be an object"):
+        _preflight_codex_api_kwargs(kwargs)
+
+
 def test_preflight_codex_api_kwargs_preserves_positive_timeout(monkeypatch):
     """Positive numeric timeouts survive preflight so the SDK honors them."""
     agent = _build_agent(monkeypatch)

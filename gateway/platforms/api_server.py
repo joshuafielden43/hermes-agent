@@ -111,7 +111,7 @@ def _structured_output_contract(value: Any, *, responses: bool) -> Optional[Dict
     if kind == "text":
         return None
     if kind == "json_object":
-        return {"type": kind, "provider_format": {"type": kind}}
+        return {"type": kind, "provider_format": {"type": kind}, "responses_format": {"type": kind}}
     if kind != "json_schema":
         raise ValueError("response format type must be text, json_object, or json_schema")
 
@@ -137,6 +137,7 @@ def _structured_output_contract(value: Any, *, responses: bool) -> Optional[Dict
         "schema": schema,
         "strict": strict,
         "provider_format": {"type": kind, "json_schema": provider_schema},
+        "responses_format": {"type": kind, **provider_schema},
     }
 
 
@@ -2038,6 +2039,8 @@ class APIServerAdapter(BasePlatformAdapter):
         # Load fallback provider chain so the API server platform has the
         # same fallback behaviour as Telegram/Discord/Slack (fixes #4954).
         fallback_model = GatewayRunner._load_fallback_model()
+        if output_contract and output_contract.get("strict"):
+            fallback_model = None
 
         agent = AIAgent(
             model=model,
@@ -2061,9 +2064,12 @@ class APIServerAdapter(BasePlatformAdapter):
         )
         if output_contract:
             overrides = dict(getattr(agent, "request_overrides", {}) or {})
-            extra_body = dict(overrides.get("extra_body") or {})
-            extra_body["response_format"] = output_contract["provider_format"]
-            overrides["extra_body"] = extra_body
+            if runtime_kwargs.get("api_mode") == "codex_responses":
+                overrides["text"] = {"format": output_contract["responses_format"]}
+            else:
+                extra_body = dict(overrides.get("extra_body") or {})
+                extra_body["response_format"] = output_contract["provider_format"]
+                overrides["extra_body"] = extra_body
             agent.request_overrides = overrides
         return agent
 
