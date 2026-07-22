@@ -163,6 +163,23 @@ def _validated_structured_output(contract: Optional[Dict[str, Any]], text: str) 
     return json.dumps(parsed, ensure_ascii=False)
 
 
+def _hermes_sidecar(
+    *, session_id: Optional[str], continuation: str, route: str,
+    contract: Optional[Dict[str, Any]], compressed: bool = False, validated: bool = True,
+) -> Dict[str, Any]:
+    """Return additive API metadata without provider reasoning or credentials."""
+    return {
+        "context": {"session_id": session_id, "continuation": continuation, "compressed": compressed},
+        "output_contract": {
+            "mode": (contract or {}).get("type", "text"),
+            "strict": bool((contract or {}).get("strict", False)),
+            "validated": validated,
+        },
+        "route": route,
+        "reasoning": {"mode": "provider_managed", "exposed": False},
+    }
+
+
 def _hermes_version() -> str:
     """Return the canonical Hermes Agent version string.
 
@@ -2967,6 +2984,10 @@ class APIServerAdapter(BasePlatformAdapter):
         if output_contract and output_contract["type"] == "json_schema" and output_contract["strict"]:
             if not await asyncio.to_thread(self._strict_structured_output_supported, route):
                 return web.json_response(_openai_error("Configured model does not support strict structured output", code="structured_output_unsupported"), status=400)
+        sidecar_context = {
+            "continuation": "session" if provided_session_id else ("caller_history" if history else "new"),
+            "route": body.get("model") if route else "default",
+        }
 
         if stream:
             import queue as _q
@@ -3062,6 +3083,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 agent_task, agent_ref, session_id=session_id,
                 gateway_session_key=gateway_session_key,
                 output_contract=output_contract,
+                sidecar_context=sidecar_context,
             )
 
         # Non-streaming: run the agent (with optional Idempotency-Key)
@@ -3101,7 +3123,9 @@ class APIServerAdapter(BasePlatformAdapter):
         try:
             final_response = _validated_structured_output(output_contract, final_response)
         except StructuredOutputValidationError as exc:
-            return web.json_response(_openai_error(str(exc), err_type="server_error", code="structured_output_validation_failed"), status=502)
+            error = _openai_error(str(exc), err_type="server_error", code="structured_output_validation_failed")
+            error["hermes"] = _hermes_sidecar(session_id=session_id, contract=output_contract, validated=False, **sidecar_context)
+            return web.json_response(error, status=502)
         is_partial = bool(result.get("partial"))
         is_failed = bool(result.get("failed"))
         completed = bool(result.get("completed", True))
@@ -3166,14 +3190,18 @@ class APIServerAdapter(BasePlatformAdapter):
                 "total_tokens": usage.get("total_tokens", 0),
             },
         }
+        response_data["hermes"] = _hermes_sidecar(
+            session_id=result.get("session_id", session_id), contract=output_contract,
+            compressed=bool(result.get("_compressed")), **sidecar_context,
+        )
         if is_partial or is_failed or not completed:
-            response_data["hermes"] = {
+            response_data["hermes"].update({
                 "completed": completed,
                 "partial": is_partial,
                 "failed": is_failed,
                 "error": err_msg,
                 "error_code": "output_truncated" if finish_reason == "length" else "agent_error",
-            }
+            })
             response_headers["X-Hermes-Completed"] = "false"
             response_headers["X-Hermes-Partial"] = "true" if is_partial else "false"
             if err_msg:
@@ -3185,6 +3213,7 @@ class APIServerAdapter(BasePlatformAdapter):
         self, request: "web.Request", completion_id: str, model: str,
         created: int, stream_q, agent_task, agent_ref=None, session_id: str = None,
         gateway_session_key: str = None, output_contract: Optional[Dict[str, Any]] = None,
+        sidecar_context: Optional[Dict[str, str]] = None,
     ) -> "web.StreamResponse":
         """Write real streaming SSE from agent's stream_delta_callback queue.
 
@@ -3322,6 +3351,14 @@ class APIServerAdapter(BasePlatformAdapter):
                     is_failed = True
                     err_msg = str(exc)
 
+            sidecar = _hermes_sidecar(
+                session_id=(result or {}).get("session_id", session_id), contract=output_contract,
+                compressed=bool((result or {}).get("_compressed")),
+                validated=not structured_output_failed,
+                **(sidecar_context or {"continuation": "new", "route": "default"}),
+            )
+            await response.write(f"event: hermes.sidecar\ndata: {json.dumps(sidecar)}\n\n".encode())
+
             # Decide finish_reason, matching the non-streaming logic: "length"
             # for truncation, "error" for failure, "stop" for normal completion.
             if is_partial and err_msg and "truncat" in err_msg.lower():
@@ -3411,6 +3448,7 @@ class APIServerAdapter(BasePlatformAdapter):
         session_id: str,
         gateway_session_key: Optional[str] = None,
         output_contract: Optional[Dict[str, Any]] = None,
+        sidecar_context: Optional[Dict[str, str]] = None,
     ) -> "web.StreamResponse":
         """Write an SSE stream for POST /v1/responses (OpenAI Responses API).
 
@@ -3910,6 +3948,11 @@ class APIServerAdapter(BasePlatformAdapter):
                     "output_tokens": usage.get("output_tokens", 0),
                     "total_tokens": usage.get("total_tokens", 0),
                 }
+                failed_env["hermes"] = _hermes_sidecar(
+                    session_id=(result or {}).get("session_id", session_id), contract=output_contract,
+                    compressed=bool((result or {}).get("_compressed")), validated=not bool(output_contract),
+                    **(sidecar_context or {"continuation": "new", "route": "default"}),
+                )
                 _failed_history = list(conversation_history)
                 _failed_history.append({"role": "user", "content": user_message})
                 if final_response_text or agent_error:
@@ -3922,6 +3965,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     conversation_history_snapshot=_failed_history,
                 )
                 terminal_snapshot_persisted = True
+                await _write_event("hermes.sidecar", failed_env["hermes"])
                 await _write_event("response.failed", {
                     "type": "response.failed",
                     "response": failed_env,
@@ -3934,6 +3978,11 @@ class APIServerAdapter(BasePlatformAdapter):
                     "output_tokens": usage.get("output_tokens", 0),
                     "total_tokens": usage.get("total_tokens", 0),
                 }
+                completed_env["hermes"] = _hermes_sidecar(
+                    session_id=(result or {}).get("session_id", session_id), contract=output_contract,
+                    compressed=bool((result or {}).get("_compressed")),
+                    **(sidecar_context or {"continuation": "new", "route": "default"}),
+                )
                 full_history = self._build_response_conversation_history(
                     conversation_history,
                     user_message,
@@ -3951,6 +4000,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     session_id_snapshot=_result_sid if isinstance(_result_sid, str) and _result_sid else None,
                 )
                 terminal_snapshot_persisted = True
+                await _write_event("hermes.sidecar", completed_env["hermes"])
                 await _write_event("response.completed", {
                     "type": "response.completed",
                     "response": completed_env,
@@ -4140,6 +4190,10 @@ class APIServerAdapter(BasePlatformAdapter):
         if output_contract and output_contract["type"] == "json_schema" and output_contract["strict"]:
             if not await asyncio.to_thread(self._strict_structured_output_supported, route):
                 return web.json_response(_openai_error("Configured model does not support strict structured output", code="structured_output_unsupported"), status=400)
+        sidecar_context = {
+            "continuation": "conversation" if conversation else ("caller_history" if raw_history else ("previous_response_id" if previous_response_id else "new")),
+            "route": body.get("model") if route else "default",
+        }
 
         stream = _coerce_request_bool(body.get("stream"), default=False)
         if stream:
@@ -4221,6 +4275,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 session_id=session_id,
                 gateway_session_key=gateway_session_key,
                 output_contract=output_contract,
+                sidecar_context=sidecar_context,
             )
 
         async def _compute_response():
@@ -4262,7 +4317,9 @@ class APIServerAdapter(BasePlatformAdapter):
         try:
             final_response = _validated_structured_output(output_contract, final_response)
         except StructuredOutputValidationError as exc:
-            return web.json_response(_openai_error(str(exc), err_type="server_error", code="structured_output_validation_failed"), status=502)
+            error = _openai_error(str(exc), err_type="server_error", code="structured_output_validation_failed")
+            error["hermes"] = _hermes_sidecar(session_id=session_id, contract=output_contract, validated=False, **sidecar_context)
+            return web.json_response(error, status=502)
         if output_contract:
             result = dict(result)
             result["final_response"] = final_response
@@ -4314,6 +4371,10 @@ class APIServerAdapter(BasePlatformAdapter):
                 "total_tokens": usage.get("total_tokens", 0),
             },
         }
+        response_data["hermes"] = _hermes_sidecar(
+            session_id=_effective_session_id, contract=output_contract,
+            compressed=bool(result.get("_compressed")), **sidecar_context,
+        )
 
         # Store the complete response object for future chaining / GET retrieval
         if store:

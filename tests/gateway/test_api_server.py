@@ -2685,6 +2685,8 @@ class TestStructuredOutput:
 
         assert resp.status == 200
         assert data["output"][-1]["content"][0]["text"] == '{"answer": 42}'
+        assert data["hermes"]["output_contract"]["mode"] == "json_schema"
+        assert data["hermes"]["reasoning"] == {"mode": "provider_managed", "exposed": False}
 
     @pytest.mark.asyncio
     async def test_invalid_structured_output_fails_without_assistant_text(self, adapter):
@@ -2796,6 +2798,7 @@ class TestResponsesStreaming:
                 assert "event: response.output_text.delta" in body
                 assert "event: response.output_text.done" in body
                 assert "event: response.completed" in body
+                assert body.index("event: hermes.sidecar") < body.index("event: response.completed")
                 assert '"sequence_number":' in body
                 assert '"logprobs": []' in body
                 assert "Hello" in body
