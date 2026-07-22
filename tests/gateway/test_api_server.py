@@ -1267,7 +1267,7 @@ class TestChatCompletionsEndpoint:
                 resp = await cli.post(
                     "/v1/chat/completions",
                     json={
-                        "model": "test",
+                        "model": "hermes-agent",
                         "messages": [{"role": "user", "content": "hi"}],
                         "stream": True,
                     },
@@ -1348,7 +1348,7 @@ class TestChatCompletionsEndpoint:
                 resp = await cli.post(
                     "/v1/chat/completions",
                     json={
-                        "model": "test",
+                        "model": "hermes-agent",
                         "messages": [{"role": "user", "content": "hi"}],
                         "stream": True,
                     },
@@ -1387,7 +1387,7 @@ class TestChatCompletionsEndpoint:
                 resp = await cli.post(
                     "/v1/chat/completions",
                     json={
-                        "model": "test",
+                        "model": "hermes-agent",
                         "messages": [{"role": "user", "content": "do the thing"}],
                         "stream": True,
                     },
@@ -1433,7 +1433,7 @@ class TestChatCompletionsEndpoint:
                 resp = await cli.post(
                     "/v1/chat/completions",
                     json={
-                        "model": "test",
+                        "model": "hermes-agent",
                         "messages": [{"role": "user", "content": "What is the answer?"}],
                         "stream": True,
                     },
@@ -1472,7 +1472,7 @@ class TestChatCompletionsEndpoint:
                 resp = await cli.post(
                     "/v1/chat/completions",
                     json={
-                        "model": "test",
+                        "model": "hermes-agent",
                         "messages": [{"role": "user", "content": "list files"}],
                         "stream": True,
                     },
@@ -1531,7 +1531,7 @@ class TestChatCompletionsEndpoint:
                 resp = await cli.post(
                     "/v1/chat/completions",
                     json={
-                        "model": "test",
+                        "model": "hermes-agent",
                         "messages": [{"role": "user", "content": "search"}],
                         "stream": True,
                     },
@@ -1594,7 +1594,7 @@ class TestChatCompletionsEndpoint:
                 resp = await cli.post(
                     "/v1/chat/completions",
                     json={
-                        "model": "test",
+                        "model": "hermes-agent",
                         "messages": [{"role": "user", "content": "list"}],
                         "stream": True,
                     },
@@ -1662,7 +1662,7 @@ class TestChatCompletionsEndpoint:
                 resp = await cli.post(
                     "/v1/chat/completions",
                     json={
-                        "model": "test",
+                        "model": "hermes-agent",
                         "messages": [{"role": "user", "content": "ok"}],
                         "stream": True,
                     },
@@ -3915,7 +3915,7 @@ class TestChatCompletionsAgentIncomplete:
             data = await resp.json()
             assert data["choices"][0]["finish_reason"] == "stop"
             assert data["choices"][0]["message"]["content"] == "All good."
-            assert "hermes" not in data
+            assert data["hermes"]["reasoning"]["exposed"] is False
             assert "X-Hermes-Completed" not in resp.headers
 
 
