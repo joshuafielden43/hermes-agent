@@ -32,6 +32,7 @@ from gateway.platforms.api_server import (
     _derive_chat_session_id,
     _hermes_version,
     _redact_api_error_text,
+    _STRUCTURED_OUTPUT_REPAIR_INSTRUCTION,
     check_api_server_requirements,
     cors_middleware,
     security_headers_middleware,
@@ -2689,7 +2690,40 @@ class TestStructuredOutput:
         assert data["hermes"]["reasoning"] == {"mode": "provider_managed", "exposed": False}
 
     @pytest.mark.asyncio
-    async def test_invalid_structured_output_fails_without_assistant_text(self, adapter):
+    async def test_invalid_structured_output_is_repaired_before_returning_to_client(self, adapter):
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
+                mock_run.side_effect = (
+                    (
+                        {"final_response": "not json", "messages": [], "api_calls": 1},
+                        {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+                    ),
+                    (
+                        {"final_response": '{"answer": 42}', "messages": [], "api_calls": 1},
+                        {"input_tokens": 3, "output_tokens": 4, "total_tokens": 7},
+                    ),
+                )
+                resp = await cli.post("/v1/chat/completions", json={
+                    "model": "hermes-agent",
+                    "messages": [{"role": "user", "content": "answer"}],
+                    "response_format": {"type": "json_object"},
+                })
+                data = await resp.json()
+
+        assert resp.status == 200
+        assert data["choices"][0]["message"]["content"] == '{"answer": 42}'
+        assert data["usage"] == {"prompt_tokens": 4, "completion_tokens": 5, "total_tokens": 9}
+        assert mock_run.await_count == 2
+        repair = mock_run.await_args_list[1].kwargs
+        assert repair["user_message"] == _STRUCTURED_OUTPUT_REPAIR_INSTRUCTION
+        assert repair["conversation_history"] == [
+            {"role": "user", "content": "answer"},
+            {"role": "assistant", "content": "not json"},
+        ]
+
+    @pytest.mark.asyncio
+    async def test_invalid_structured_output_fails_after_one_repair_attempt(self, adapter):
         app = _create_app(adapter)
         async with TestClient(TestServer(app)) as cli:
             with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
@@ -2706,6 +2740,7 @@ class TestStructuredOutput:
 
         assert resp.status == 502
         assert error["error"]["code"] == "structured_output_validation_failed"
+        assert mock_run.await_count == 2
 
     @pytest.mark.asyncio
     async def test_strict_schema_requires_configured_capability(self, adapter):
