@@ -881,10 +881,8 @@ PLATFORM_HINTS = {
         "— when a sticker is the right response, use yb_send_sticker."
     ),
     "api_server": (
-        "You're responding through an API server. The rendering layer is unknown — "
-        "assume plain text. No markdown formatting (no asterisks, bullets, headers, "
-        "code fences). Treat this like a conversation, not a document. Keep responses "
-        "brief and natural."
+        "You're responding through a programmatic API. Follow the caller's requested "
+        "output format exactly. Never expose private reasoning or provider metadata."
     ),
     "webui": (
         "You are in the Hermes WebUI, a browser-based chat interface. "

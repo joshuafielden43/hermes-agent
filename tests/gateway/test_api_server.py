@@ -2643,7 +2643,133 @@ class TestResponsesEndpoint:
             assert resp.status == 400
 
 
+class TestStructuredOutput:
+    @pytest.mark.asyncio
+    async def test_chat_response_format_validates_and_normalizes_json(self, adapter):
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
+                mock_run.return_value = (
+                    {"final_response": "```json\n{\"answer\": 42}\n```", "messages": [], "api_calls": 1},
+                    {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+                )
+                resp = await cli.post("/v1/chat/completions", json={
+                    "model": "hermes-agent",
+                    "messages": [{"role": "user", "content": "answer"}],
+                    "response_format": {"type": "json_object"},
+                })
+                data = await resp.json()
+
+        assert resp.status == 200
+        assert data["choices"][0]["message"]["content"] == '{"answer": 42}'
+        assert mock_run.call_args.kwargs["output_contract"]["type"] == "json_object"
+
+    @pytest.mark.asyncio
+    async def test_responses_text_format_validates_json_schema(self, adapter):
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
+                mock_run.return_value = (
+                    {"final_response": '{"answer": 42}', "messages": [], "api_calls": 1},
+                    {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+                )
+                resp = await cli.post("/v1/responses", json={
+                    "model": "hermes-agent",
+                    "input": "answer",
+                    "text": {"format": {
+                        "type": "json_schema", "name": "answer",
+                        "schema": {"type": "object", "required": ["answer"]},
+                    }},
+                })
+                data = await resp.json()
+
+        assert resp.status == 200
+        assert data["output"][-1]["content"][0]["text"] == '{"answer": 42}'
+
+    @pytest.mark.asyncio
+    async def test_invalid_structured_output_fails_without_assistant_text(self, adapter):
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
+                mock_run.return_value = (
+                    {"final_response": "not json", "messages": [], "api_calls": 1},
+                    {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+                )
+                resp = await cli.post("/v1/chat/completions", json={
+                    "model": "hermes-agent",
+                    "messages": [{"role": "user", "content": "answer"}],
+                    "response_format": {"type": "json_object"},
+                })
+                error = await resp.json()
+
+        assert resp.status == 502
+        assert error["error"]["code"] == "structured_output_validation_failed"
+
+    @pytest.mark.asyncio
+    async def test_strict_schema_requires_configured_capability(self, adapter):
+        app = _create_app(adapter)
+        with patch.object(adapter, "_strict_structured_output_supported", return_value=False):
+            async with TestClient(TestServer(app)) as cli:
+                resp = await cli.post("/v1/chat/completions", json={
+                    "model": "hermes-agent",
+                    "messages": [{"role": "user", "content": "answer"}],
+                    "response_format": {"type": "json_schema", "json_schema": {
+                        "name": "answer", "strict": True, "schema": {"type": "object"},
+                    }},
+                })
+                error = await resp.json()
+
+        assert resp.status == 400
+        assert error["error"]["code"] == "structured_output_unsupported"
+
+
 class TestResponsesStreaming:
+    @pytest.mark.asyncio
+    async def test_structured_chat_stream_withholds_invalid_text(self, adapter):
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            async def _mock_run_agent(**kwargs):
+                kwargs["stream_delta_callback"]("not json")
+                return (
+                    {"final_response": "not json", "messages": [], "api_calls": 1},
+                    {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+                )
+
+            with patch.object(adapter, "_run_agent", side_effect=_mock_run_agent):
+                resp = await cli.post("/v1/chat/completions", json={
+                    "model": "hermes-agent", "stream": True,
+                    "messages": [{"role": "user", "content": "answer"}],
+                    "response_format": {"type": "json_object"},
+                })
+                body = await resp.text()
+
+        assert resp.status == 200
+        assert "not json" not in body
+        assert "structured_output_validation_failed" in body
+
+    @pytest.mark.asyncio
+    async def test_structured_responses_stream_withholds_invalid_text(self, adapter):
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            async def _mock_run_agent(**kwargs):
+                kwargs["stream_delta_callback"]("not json")
+                return (
+                    {"final_response": "not json", "messages": [], "api_calls": 1},
+                    {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+                )
+
+            with patch.object(adapter, "_run_agent", side_effect=_mock_run_agent):
+                resp = await cli.post("/v1/responses", json={
+                    "model": "hermes-agent", "input": "answer", "stream": True,
+                    "text": {"format": {"type": "json_object"}},
+                })
+                body = await resp.text()
+
+        assert resp.status == 200
+        assert "not json" not in body
+        assert "event: response.failed" in body
+        assert "structured_output_validation_failed" in body
+
     @pytest.mark.asyncio
     async def test_stream_true_returns_responses_sse(self, adapter):
         app = _create_app(adapter)
@@ -4568,6 +4694,21 @@ class TestModelRoutesHandlers:
 
 
 class TestModelRoutesAgentCreation:
+    def test_output_contract_is_forwarded_to_provider(self, monkeypatch):
+        captured = {}
+
+        class FakeAgent:
+            def __init__(self, **kwargs):
+                captured.update(kwargs)
+                self.request_overrides = kwargs.get("request_overrides", {})
+
+        _patch_create_agent_runtime(monkeypatch, captured, FakeAgent)
+        adapter = _make_routing_adapter({})
+        monkeypatch.setattr(adapter, "_ensure_session_db", lambda: None)
+        agent = adapter._create_agent(output_contract={"provider_format": {"type": "json_object"}})
+
+        assert agent.request_overrides["extra_body"]["response_format"] == {"type": "json_object"}
+
     def test_route_overrides_model_and_credentials(self, monkeypatch):
         captured = {}
 

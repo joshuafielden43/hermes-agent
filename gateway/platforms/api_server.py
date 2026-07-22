@@ -57,6 +57,8 @@ import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+import jsonschema
+
 # Sentinel returned by _resolve_request_profile when a /p/<profile>/ prefix
 # names a profile this gateway does not serve (→ 404). Distinct from None
 # (no prefix / multiplexing off → handle as the default profile).
@@ -93,6 +95,72 @@ from agent.redact import redact_sensitive_text
 from gateway.readiness import collect_runtime_readiness
 
 logger = logging.getLogger(__name__)
+
+
+class StructuredOutputValidationError(ValueError):
+    """The provider returned text that does not meet the requested contract."""
+
+
+def _structured_output_contract(value: Any, *, responses: bool) -> Optional[Dict[str, Any]]:
+    """Normalize Chat ``response_format`` and Responses ``text.format``."""
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise ValueError("response format must be an object")
+    kind = value.get("type")
+    if kind == "text":
+        return None
+    if kind == "json_object":
+        return {"type": kind, "provider_format": {"type": kind}}
+    if kind != "json_schema":
+        raise ValueError("response format type must be text, json_object, or json_schema")
+
+    schema_spec = value if responses else value.get("json_schema")
+    if not isinstance(schema_spec, dict):
+        raise ValueError("json_schema requires a json_schema object")
+    name = schema_spec.get("name")
+    schema = schema_spec.get("schema")
+    strict = schema_spec.get("strict", False)
+    if not isinstance(name, str) or not name.strip() or not isinstance(schema, dict):
+        raise ValueError("json_schema requires string name and object schema")
+    if not isinstance(strict, bool):
+        raise ValueError("json_schema.strict must be a boolean")
+    try:
+        jsonschema.Draft202012Validator.check_schema(schema)
+    except jsonschema.SchemaError as exc:
+        raise ValueError(f"invalid JSON Schema: {exc.message}") from exc
+    provider_schema = {"name": name, "schema": schema, "strict": strict}
+    if isinstance(schema_spec.get("description"), str):
+        provider_schema["description"] = schema_spec["description"]
+    return {
+        "type": kind,
+        "schema": schema,
+        "strict": strict,
+        "provider_format": {"type": kind, "json_schema": provider_schema},
+    }
+
+
+def _validated_structured_output(contract: Optional[Dict[str, Any]], text: str) -> str:
+    """Parse fenced/provider text and return canonical validated JSON."""
+    if contract is None:
+        return text
+    payload = text.strip()
+    if payload.startswith("```"):
+        payload = payload.split("\n", 1)[1] if "\n" in payload else ""
+        if payload.endswith("```"):
+            payload = payload[:-3].rstrip()
+    try:
+        parsed = json.loads(payload)
+    except json.JSONDecodeError as exc:
+        raise StructuredOutputValidationError("model output was not valid JSON") from exc
+    if contract["type"] == "json_object" and not isinstance(parsed, dict):
+        raise StructuredOutputValidationError("model output was not a JSON object")
+    if contract["type"] == "json_schema":
+        try:
+            jsonschema.validate(parsed, contract["schema"])
+        except jsonschema.ValidationError as exc:
+            raise StructuredOutputValidationError("model output did not match the requested JSON Schema") from exc
+    return json.dumps(parsed, ensure_ascii=False)
 
 
 def _hermes_version() -> str:
@@ -1815,6 +1883,17 @@ class APIServerAdapter(BasePlatformAdapter):
             _openai_error(f"Unknown model: {model}", code="invalid_model"), status=400
         )
 
+    def _strict_structured_output_supported(self, route: Optional[Dict[str, Any]]) -> bool:
+        """Return whether the configured route advertises strict JSON support."""
+        from agent.models_dev import get_model_info
+        from gateway.run import _resolve_gateway_model, _resolve_runtime_agent_kwargs
+
+        runtime = _resolve_runtime_agent_kwargs()
+        provider = (route or {}).get("provider") or runtime.get("provider")
+        model = (route or {}).get("model") or _resolve_gateway_model()
+        info = get_model_info(str(provider or ""), str(model or ""))
+        return bool(info and info.structured_output)
+
     def _session_model_override_for(self, session_key: Optional[str]) -> Optional[Dict[str, Any]]:
         """Return the gateway's session ``/model`` override for *session_key*, if any.
 
@@ -1846,6 +1925,7 @@ class APIServerAdapter(BasePlatformAdapter):
         tool_complete_callback=None,
         gateway_session_key: Optional[str] = None,
         route: Optional[Dict[str, Any]] = None,
+        output_contract: Optional[Dict[str, Any]] = None,
     ) -> Any:
         """
         Create an AIAgent instance using the gateway's runtime config.
@@ -1962,6 +2042,12 @@ class APIServerAdapter(BasePlatformAdapter):
             reasoning_config=reasoning_config,
             gateway_session_key=gateway_session_key,
         )
+        if output_contract:
+            overrides = dict(getattr(agent, "request_overrides", {}) or {})
+            extra_body = dict(overrides.get("extra_body") or {})
+            extra_body["response_format"] = output_contract["provider_format"]
+            overrides["extra_body"] = extra_body
+            agent.request_overrides = overrides
         return agent
 
     # ------------------------------------------------------------------
@@ -2874,6 +2960,13 @@ class APIServerAdapter(BasePlatformAdapter):
         route, route_error = self._route_for_request(body.get("model"))
         if route_error is not None:
             return route_error
+        try:
+            output_contract = _structured_output_contract(body.get("response_format"), responses=False)
+        except ValueError as exc:
+            return web.json_response(_openai_error(str(exc), code="invalid_response_format"), status=400)
+        if output_contract and output_contract["type"] == "json_schema" and output_contract["strict"]:
+            if not await asyncio.to_thread(self._strict_structured_output_supported, route):
+                return web.json_response(_openai_error("Configured model does not support strict structured output", code="structured_output_unsupported"), status=400)
 
         if stream:
             import queue as _q
@@ -2958,6 +3051,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 agent_ref=agent_ref,
                 gateway_session_key=gateway_session_key,
                 route=route,
+                output_contract=output_contract,
             ))
             # Ensure SSE drain loops can terminate without relying on polling
             # agent_task.done(), which can race with queue timeout checks.
@@ -2967,6 +3061,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 request, completion_id, model_name, created, _stream_q,
                 agent_task, agent_ref, session_id=session_id,
                 gateway_session_key=gateway_session_key,
+                output_contract=output_contract,
             )
 
         # Non-streaming: run the agent (with optional Idempotency-Key)
@@ -2978,11 +3073,12 @@ class APIServerAdapter(BasePlatformAdapter):
                 session_id=session_id,
                 gateway_session_key=gateway_session_key,
                 route=route,
+                output_contract=output_contract,
             )
 
         idempotency_key = request.headers.get("Idempotency-Key")
         if idempotency_key:
-            fp = _make_request_fingerprint(body, keys=["model", "messages", "tools", "tool_choice", "stream"])
+            fp = _make_request_fingerprint(body, keys=["model", "messages", "tools", "tool_choice", "stream", "response_format"])
             try:
                 result, usage = await _idem_cache.get_or_set(idempotency_key, fp, _compute_completion)
             except Exception as e:
@@ -3002,6 +3098,10 @@ class APIServerAdapter(BasePlatformAdapter):
                 )
 
         final_response = _resolve_media_to_data_urls(result.get("final_response") or "")
+        try:
+            final_response = _validated_structured_output(output_contract, final_response)
+        except StructuredOutputValidationError as exc:
+            return web.json_response(_openai_error(str(exc), err_type="server_error", code="structured_output_validation_failed"), status=502)
         is_partial = bool(result.get("partial"))
         is_failed = bool(result.get("failed"))
         completed = bool(result.get("completed", True))
@@ -3084,7 +3184,7 @@ class APIServerAdapter(BasePlatformAdapter):
     async def _write_sse_chat_completion(
         self, request: "web.Request", completion_id: str, model: str,
         created: int, stream_q, agent_task, agent_ref=None, session_id: str = None,
-        gateway_session_key: str = None,
+        gateway_session_key: str = None, output_contract: Optional[Dict[str, Any]] = None,
     ) -> "web.StreamResponse":
         """Write real streaming SSE from agent's stream_delta_callback queue.
 
@@ -3114,6 +3214,7 @@ class APIServerAdapter(BasePlatformAdapter):
 
         try:
             last_activity = time.monotonic()
+            held_output: List[str] = []
 
             # Role chunk
             role_chunk = {
@@ -3125,6 +3226,15 @@ class APIServerAdapter(BasePlatformAdapter):
             last_activity = time.monotonic()
 
             # Helper — route a queue item to the correct SSE event.
+            async def _emit_content(content: str):
+                content_chunk = {
+                    "id": completion_id, "object": "chat.completion.chunk",
+                    "created": created, "model": model,
+                    "choices": [{"index": 0, "delta": {"content": content}, "finish_reason": None}],
+                }
+                await response.write(f"data: {json.dumps(content_chunk)}\n\n".encode())
+                return time.monotonic()
+
             async def _emit(item):
                 """Write a single queue item to the SSE stream.
 
@@ -3140,13 +3250,10 @@ class APIServerAdapter(BasePlatformAdapter):
                     await response.write(
                         f"event: hermes.tool.progress\ndata: {event_data}\n\n".encode()
                     )
+                elif output_contract:
+                    held_output.append(item)
                 else:
-                    content_chunk = {
-                        "id": completion_id, "object": "chat.completion.chunk",
-                        "created": created, "model": model,
-                        "choices": [{"index": 0, "delta": {"content": item}, "finish_reason": None}],
-                    }
-                    await response.write(f"data: {json.dumps(content_chunk)}\n\n".encode())
+                    return await _emit_content(item)
                 return time.monotonic()
 
             # Stream content chunks as they arrive from the agent
@@ -3205,6 +3312,16 @@ class APIServerAdapter(BasePlatformAdapter):
                 is_failed = True
                 err_msg = err_msg or str(agent_error)
 
+            structured_output_failed = False
+            if output_contract and not is_failed and completed:
+                raw_output = result.get("final_response", "") if isinstance(result, dict) else ""
+                try:
+                    await _emit_content(_validated_structured_output(output_contract, raw_output or "".join(held_output)))
+                except StructuredOutputValidationError as exc:
+                    structured_output_failed = True
+                    is_failed = True
+                    err_msg = str(exc)
+
             # Decide finish_reason, matching the non-streaming logic: "length"
             # for truncation, "error" for failure, "stop" for normal completion.
             if is_partial and err_msg and "truncat" in err_msg.lower():
@@ -3237,7 +3354,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     "partial": is_partial,
                     "failed": is_failed,
                     "error": err_msg,
-                    "error_code": "output_truncated" if finish_reason == "length" else "agent_error",
+                    "error_code": "structured_output_validation_failed" if structured_output_failed else ("output_truncated" if finish_reason == "length" else "agent_error"),
                 }
             await response.write(f"data: {json.dumps(finish_chunk)}\n\n".encode())
             await response.write(b"data: [DONE]\n\n")
@@ -3293,6 +3410,7 @@ class APIServerAdapter(BasePlatformAdapter):
         store: bool,
         session_id: str,
         gateway_session_key: Optional[str] = None,
+        output_contract: Optional[Dict[str, Any]] = None,
     ) -> "web.StreamResponse":
         """Write an SSE stream for POST /v1/responses (OpenAI Responses API).
 
@@ -3385,6 +3503,8 @@ class APIServerAdapter(BasePlatformAdapter):
         agent_error: Optional[str] = None
         usage: Dict[str, int] = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
         terminal_snapshot_persisted = False
+        held_output: List[str] = []
+        release_structured_output = False
 
         def _persist_response_snapshot(
             response_env: Dict[str, Any],
@@ -3474,6 +3594,9 @@ class APIServerAdapter(BasePlatformAdapter):
                 })
 
             async def _emit_text_delta(delta_text: str) -> None:
+                if output_contract and not release_structured_output:
+                    held_output.append(delta_text)
+                    return
                 await _open_message_item()
                 final_text_parts.append(delta_text)
                 await _write_event("response.output_text.delta", {
@@ -3686,15 +3809,25 @@ class APIServerAdapter(BasePlatformAdapter):
             try:
                 result, agent_usage = await agent_task
                 usage = agent_usage or usage
-                # If the agent produced a final_response but no text
-                # deltas were streamed (e.g. some providers only emit
-                # the full response at the end), emit a single fallback
-                # delta so Responses clients still receive a live text part.
                 agent_final = result.get("final_response", "") if isinstance(result, dict) else ""
-                if agent_final and not final_text_parts:
-                    await _emit_text_delta(agent_final)
-                if agent_final and not final_response_text:
-                    final_response_text = agent_final
+                if output_contract:
+                    try:
+                        final_response_text = _validated_structured_output(
+                            output_contract, agent_final or "".join(held_output)
+                        )
+                        release_structured_output = True
+                        await _emit_text_delta(final_response_text)
+                    except StructuredOutputValidationError as exc:
+                        agent_error = str(exc)
+                else:
+                    # If the agent produced a final_response but no text
+                    # deltas were streamed (e.g. some providers only emit
+                    # the full response at the end), emit a single fallback
+                    # delta so Responses clients still receive a live text part.
+                    if agent_final and not final_text_parts:
+                        await _emit_text_delta(agent_final)
+                    if agent_final and not final_response_text:
+                        final_response_text = agent_final
                 if isinstance(result, dict) and result.get("error") and not final_response_text:
                     agent_error = _redact_api_error_text(result["error"])
             except Exception as e:  # noqa: BLE001
@@ -3768,7 +3901,10 @@ class APIServerAdapter(BasePlatformAdapter):
             if agent_error:
                 failed_env = _envelope("failed")
                 failed_env["output"] = final_items
-                failed_env["error"] = {"message": _redact_api_error_text(agent_error), "type": "server_error"}
+                failed_env["error"] = {
+                    "message": _redact_api_error_text(agent_error), "type": "server_error",
+                    "code": "structured_output_validation_failed" if output_contract else "agent_error",
+                }
                 failed_env["usage"] = {
                     "input_tokens": usage.get("input_tokens", 0),
                     "output_tokens": usage.get("output_tokens", 0),
@@ -3996,6 +4132,14 @@ class APIServerAdapter(BasePlatformAdapter):
         route, route_error = self._route_for_request(body.get("model"))
         if route_error is not None:
             return route_error
+        try:
+            text = body.get("text") or {}
+            output_contract = _structured_output_contract(text.get("format") if isinstance(text, dict) else text, responses=True)
+        except ValueError as exc:
+            return web.json_response(_openai_error(str(exc), code="invalid_response_format"), status=400)
+        if output_contract and output_contract["type"] == "json_schema" and output_contract["strict"]:
+            if not await asyncio.to_thread(self._strict_structured_output_supported, route):
+                return web.json_response(_openai_error("Configured model does not support strict structured output", code="structured_output_unsupported"), status=400)
 
         stream = _coerce_request_bool(body.get("stream"), default=False)
         if stream:
@@ -4051,6 +4195,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 agent_ref=agent_ref,
                 gateway_session_key=gateway_session_key,
                 route=route,
+                output_contract=output_contract,
             ))
             # Ensure SSE drain loops can terminate without relying on polling
             # agent_task.done(), which can race with queue timeout checks.
@@ -4075,6 +4220,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 store=store,
                 session_id=session_id,
                 gateway_session_key=gateway_session_key,
+                output_contract=output_contract,
             )
 
         async def _compute_response():
@@ -4085,13 +4231,14 @@ class APIServerAdapter(BasePlatformAdapter):
                 session_id=session_id,
                 gateway_session_key=gateway_session_key,
                 route=route,
+                output_contract=output_contract,
             )
 
         idempotency_key = request.headers.get("Idempotency-Key")
         if idempotency_key:
             fp = _make_request_fingerprint(
                 body,
-                keys=["input", "instructions", "previous_response_id", "conversation", "model", "tools"],
+                keys=["input", "instructions", "previous_response_id", "conversation", "model", "tools", "text"],
             )
             try:
                 result, usage = await _idem_cache.get_or_set(idempotency_key, fp, _compute_response)
@@ -4112,6 +4259,13 @@ class APIServerAdapter(BasePlatformAdapter):
                 )
 
         final_response = _resolve_media_to_data_urls(result.get("final_response", ""))
+        try:
+            final_response = _validated_structured_output(output_contract, final_response)
+        except StructuredOutputValidationError as exc:
+            return web.json_response(_openai_error(str(exc), err_type="server_error", code="structured_output_validation_failed"), status=502)
+        if output_contract:
+            result = dict(result)
+            result["final_response"] = final_response
         if not final_response:
             final_response = _redact_api_error_text(result.get("error", "(No response generated)"))
 
@@ -4763,6 +4917,7 @@ class APIServerAdapter(BasePlatformAdapter):
         agent_ref: Optional[list] = None,
         gateway_session_key: Optional[str] = None,
         route: Optional[Dict[str, Any]] = None,
+        output_contract: Optional[Dict[str, Any]] = None,
     ) -> tuple:
         """
         Create an agent and run a conversation in a thread executor.
@@ -4804,6 +4959,7 @@ class APIServerAdapter(BasePlatformAdapter):
                         tool_complete_callback=tool_complete_callback,
                         gateway_session_key=gateway_session_key,
                         route=route,
+                        output_contract=output_contract,
                     )
                     if agent_ref is not None:
                         agent_ref[0] = agent
