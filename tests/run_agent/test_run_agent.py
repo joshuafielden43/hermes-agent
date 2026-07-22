@@ -6098,6 +6098,39 @@ class TestRetryExhaustion:
         assert "error" in result
         assert "rate limited" in result["error"]
 
+    def test_transient_stream_error_retries_and_recovers(self, agent):
+        """A retryable stream error must re-enter the provider-call loop."""
+        self._setup_agent(agent)
+        recovered = SimpleNamespace(
+            choices=[SimpleNamespace(
+                message=SimpleNamespace(
+                    content="recovered", tool_calls=None, reasoning=None,
+                    reasoning_content=None, refusal=None,
+                ),
+                finish_reason="stop",
+            )],
+            model="test/model",
+            usage=None,
+            id="resp_recovered",
+        )
+        agent.client.chat.completions.create.side_effect = [
+            run_agent._StreamErrorEvent("Service temporarily unavailable"),
+            recovered,
+        ]
+        from agent import conversation_loop as _conv_loop
+        with (
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+            patch("run_agent.time", self._make_fast_time_mock()),
+            patch.object(_conv_loop, "time", self._make_fast_time_mock()),
+            patch.object(_conv_loop, "jittered_backoff", lambda *a, **k: 0.0),
+        ):
+            result = agent.run_conversation("hello")
+        assert result.get("completed") is True
+        assert result.get("final_response") == "recovered"
+        assert agent.client.chat.completions.create.call_count == 2
+
     def test_build_api_kwargs_error_no_unbound_local(self, agent):
         """When _build_api_kwargs raises, except handler must not crash with UnboundLocalError.
 
