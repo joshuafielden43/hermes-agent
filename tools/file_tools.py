@@ -1580,6 +1580,11 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
     Pass ``True`` after explicit user direction — same shape as ``force``
     on the terminal tool.
     """
+    from tools.path_security import write_root_denial
+
+    root_err = write_root_denial(path, task_id)
+    if root_err:
+        return tool_error(root_err)
     sensitive_err = _check_sensitive_path(path, task_id)
     if sensitive_err:
         return tool_error(sensitive_err)
@@ -1707,7 +1712,12 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
                 if _err:
                     return _err
                 _paths_to_check.append(v4a_path)
+    from tools.path_security import write_root_denial
+
     for _p in _paths_to_check:
+        root_err = write_root_denial(_p, task_id)
+        if root_err:
+            return tool_error(root_err)
         sensitive_err = _check_sensitive_path(_p, task_id)
         if sensitive_err:
             return tool_error(sensitive_err)

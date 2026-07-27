@@ -6300,6 +6300,8 @@ class AIAgent:
             role=function_args.get("role"),
             background=(not _is_subagent),
             parent_agent=self,
+            enabled_tools=function_args.get("enabled_tools"),
+            write_roots=function_args.get("write_roots"),
         )
 
     def _invoke_tool(self, function_name: str, function_args: dict, effective_task_id: str,

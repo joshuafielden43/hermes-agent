@@ -53,6 +53,21 @@ DELEGATE_BLOCKED_TOOLS = frozenset(
     ]
 )
 
+# Progressive-disclosure bridges can reopen tools outside a narrowed schema.
+_BRIDGE_TOOLS = frozenset({"tool_call", "tool_search", "tool_describe"})
+
+# Shell/process tools ignore file write-root guards — drop them when roots set.
+_WRITE_SCOPED_BLOCKED_TOOLS = frozenset(
+    [
+        "terminal",
+        "process",
+        "execute_code",
+        "computer_use",
+        "read_terminal",
+        "close_terminal",
+    ]
+)
+
 
 # ---------------------------------------------------------------------------
 # Subagent approval callbacks
@@ -783,6 +798,67 @@ def _strip_blocked_tools(toolsets: List[str]) -> List[str]:
     return [t for t in toolsets if t not in blocked_toolset_names]
 
 
+def _normalize_str_list(value: Any) -> Optional[List[str]]:
+    """Coerce a model-supplied list/tuple of strings; None stays None."""
+    if value is None:
+        return None
+    if isinstance(value, str):
+        text = value.strip()
+        return [text] if text else []
+    if not isinstance(value, (list, tuple)):
+        return []
+    out: List[str] = []
+    for item in value:
+        text = str(item or "").strip()
+        if text:
+            out.append(text)
+    return out
+
+
+def _resolve_child_enabled_tools(
+    parent_agent,
+    requested: Optional[List[str]],
+    *,
+    write_roots: Optional[List[str]],
+) -> Optional[List[str]]:
+    """Intersect requested tool names with the parent; never widen.
+
+    None means inherit (no exact filter). Empty list means no tools.
+    """
+    if requested is None:
+        return None
+    parent_names = set(getattr(parent_agent, "valid_tool_names", None) or [])
+    if not parent_names and getattr(parent_agent, "enabled_toolsets", None) is None:
+        # Parent advertises "all tools" without a concrete name set — use the
+        # request as-is after hard blocks (tests/mocks).
+        allow = set(requested)
+    else:
+        allow = set(requested) & parent_names
+    allow -= DELEGATE_BLOCKED_TOOLS
+    allow -= _BRIDGE_TOOLS
+    if write_roots:
+        allow -= _WRITE_SCOPED_BLOCKED_TOOLS
+    return sorted(allow)
+
+
+def _apply_exact_tool_filter(child, enabled_tools: Optional[List[str]]) -> None:
+    """Keep only *enabled_tools* on a built child; record for later refresh."""
+    if enabled_tools is None:
+        child._exact_enabled_tools = None
+        return
+    allow = set(enabled_tools)
+    child._exact_enabled_tools = frozenset(allow)
+    tools = getattr(child, "tools", None) or []
+    child.tools = [
+        t
+        for t in tools
+        if isinstance(t, dict) and t.get("function", {}).get("name") in allow
+    ]
+    child.valid_tool_names = {
+        t["function"]["name"] for t in child.tools if isinstance(t, dict)
+    }
+
+
 def _blocked_toolsets_for_role(role: str) -> List[str]:
     """Return one-tool deny toolsets for a delegated child role.
 
@@ -1085,6 +1161,9 @@ def _build_child_agent(
     # 'leaf' (default) cannot; 'orchestrator' retains the delegation
     # toolset subject to depth/kill-switch bounds applied below.
     role: str = "leaf",
+    # Parent-selected non-widening capability subset (#1612).
+    enabled_tools: Optional[List[str]] = None,
+    write_roots: Optional[List[str]] = None,
 ):
     """
     Build a child AIAgent on the main thread (thread-safe construction).
@@ -1119,6 +1198,28 @@ def _build_child_agent(
     tui_depth = max(0, child_depth - 1)  # 0 = first-level child for the UI
 
     delegation_cfg = _load_config()
+
+    from tools.path_security import resolve_write_roots
+
+    workspace_hint = _resolve_workspace_hint(parent_agent)
+    parent_write_roots = getattr(parent_agent, "_write_roots", None)
+    resolved_write_roots = resolve_write_roots(
+        write_roots,
+        workspace=workspace_hint,
+        parent_roots=parent_write_roots,
+    )
+    exact_tools = _resolve_child_enabled_tools(
+        parent_agent,
+        enabled_tools,
+        write_roots=resolved_write_roots or None,
+    )
+    if exact_tools is None and resolved_write_roots:
+        # write_roots without an explicit tool list still drop shell escapes.
+        parent_names = set(getattr(parent_agent, "valid_tool_names", None) or [])
+        if parent_names:
+            exact_tools = sorted(parent_names - DELEGATE_BLOCKED_TOOLS - _BRIDGE_TOOLS - _WRITE_SCOPED_BLOCKED_TOOLS)
+        else:
+            exact_tools = None  # can't derive; parent toolsets + disabled still apply
 
     # When no explicit toolsets given, inherit from parent's enabled toolsets
     # so disabled tools (e.g. web) don't leak to subagents.
@@ -1186,7 +1287,7 @@ def _build_child_agent(
     if effective_role == "orchestrator" and "delegation" not in child_toolsets:
         child_toolsets.append("delegation")
 
-    workspace_hint = _resolve_workspace_hint(parent_agent)
+    # workspace_hint already resolved above for write-root anchoring
     child_prompt = _build_child_system_prompt(
         goal,
         context,
@@ -1402,6 +1503,10 @@ def _build_child_agent(
         **child_optional_kwargs,
     )
     child._print_fn = getattr(parent_agent, "_print_fn", None)
+    # Exact non-widening tool allowlist (#1612) — applied after construction so
+    # memory/context-engine injectors still run, then get filtered.
+    _apply_exact_tool_filter(child, exact_tools)
+    child._write_roots = list(resolved_write_roots) if resolved_write_roots else None
     # Now the child exists, its session id can ride on every relayed event
     # (including the spawn_requested below — first emit happens after this).
     child_session_ref["session_id"] = getattr(child, "session_id", "") or ""
@@ -1962,6 +2067,13 @@ def _run_single_child(
             record_session_cwd(child_task_id, get_session_cwd(parent_task_id))
         except Exception as e:
             logger.debug("Child cwd seed failed: %s", e)
+
+        from tools.path_security import clear_task_write_roots, set_task_write_roots
+
+        child_roots = getattr(child, "_write_roots", None) or None
+        if child_roots:
+            set_task_write_roots(child_task_id, child_roots)
+
         wall_start = time.time()
         parent_reads_snapshot = (
             list(file_state.known_reads(parent_task_id)) if parent_task_id else []
@@ -2008,6 +2120,10 @@ def _run_single_child(
             )
 
         _child_future = _timeout_executor.submit(_run_with_thread_capture)
+        if child_roots:
+            _child_future.add_done_callback(
+                lambda _f, tid=child_task_id: clear_task_write_roots(tid)
+            )
         try:
             result = _child_future.result(timeout=child_timeout)
         except Exception as _timeout_exc:
@@ -2430,6 +2546,8 @@ def delegate_task(
     role: Optional[str] = None,
     background: Optional[bool] = None,
     parent_agent=None,
+    enabled_tools: Optional[List[str]] = None,
+    write_roots: Optional[List[str]] = None,
 ) -> str:
     """
     Spawn one or more child agents to handle delegated tasks.
@@ -2459,6 +2577,8 @@ def delegate_task(
 
     # Normalise the top-level role once; per-task overrides re-normalise.
     top_role = _normalize_role(role)
+    top_enabled_tools = _normalize_str_list(enabled_tools)
+    top_write_roots = _normalize_str_list(write_roots)
 
     # Background (async) delegation now applies to BOTH single tasks and
     # batches. A batch is dispatched as ONE async unit: the whole fan-out runs
@@ -2589,8 +2709,8 @@ def delegate_task(
                 task_index=i,
                 goal=t["goal"],
                 context=t.get("context"),
-                # Subagents always inherit the parent's toolsets; the model
-                # cannot choose or narrow them (no model-facing toolsets arg).
+                # Toolset groups still inherit from the parent; exact names
+                # below are the non-widening allowlist when the parent sets them.
                 toolsets=None,
                 model=creds["model"],
                 max_iterations=effective_max_iter,
@@ -2605,6 +2725,12 @@ def delegate_task(
                 override_acp_command=creds.get("command"),
                 override_acp_args=creds.get("args"),
                 role=effective_role,
+                enabled_tools=_normalize_str_list(t.get("enabled_tools"))
+                if t.get("enabled_tools") is not None
+                else top_enabled_tools,
+                write_roots=_normalize_str_list(t.get("write_roots"))
+                if t.get("write_roots") is not None
+                else top_write_roots,
             )
             # Override with correct parent tool names (before child construction mutated global)
             child._delegate_saved_tool_names = _parent_tool_names
@@ -3562,6 +3688,16 @@ DELEGATE_TASK_SCHEMA = {
                             "enum": ["leaf", "orchestrator"],
                             "description": "Per-task role override. See top-level 'role' for semantics.",
                         },
+                        "enabled_tools": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "Per-task tool allowlist override. See top-level enabled_tools.",
+                        },
+                        "write_roots": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "Per-task write-root override. See top-level write_roots.",
+                        },
                     },
                     "required": ["goal"],
                 },
@@ -3585,6 +3721,30 @@ DELEGATE_TASK_SCHEMA = {
                     "the work finishes; just continue working in the meantime. "
                     "Setting this has no effect; the parameter remains only for "
                     "backward compatibility."
+                ),
+            },
+            "enabled_tools": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": (
+                    "Optional non-widening tool-name allowlist for the child. "
+                    "Intersected with the parent's actual tools; blocked "
+                    "side-effect tools (delegate_task, clarify, memory, "
+                    "send_message, cronjob) and tool-search bridges are always "
+                    "removed. When write_roots is set, terminal/process/"
+                    "execute_code are also removed. Omit to inherit the full "
+                    "parent tool surface (minus role blocks)."
+                ),
+            },
+            "write_roots": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": (
+                    "Optional absolute or workspace-relative directories the child "
+                    "may write/patch inside. Enforced on write_file and patch "
+                    "for the child's task_id. Nested children may only further "
+                    "narrow roots. Pair with enabled_tools that exclude shell "
+                    "tools — file guards do not constrain terminal."
                 ),
             },
         },
@@ -3648,6 +3808,8 @@ registry.register(
         role=args.get("role"),
         background=_model_background_value(args, kw.get("parent_agent")),
         parent_agent=kw.get("parent_agent"),
+        enabled_tools=args.get("enabled_tools"),
+        write_roots=args.get("write_roots"),
     ),
     check_fn=check_delegate_requirements,
     emoji="🔀",

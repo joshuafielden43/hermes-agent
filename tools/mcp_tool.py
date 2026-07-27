@@ -6084,6 +6084,18 @@ def refresh_agent_mcp_tools(
             return set()
         agent.tools = new_defs
         agent.valid_tool_names = new_names
+        exact = getattr(agent, "_exact_enabled_tools", None)
+        if exact is not None:
+            # Keep delegated exact allowlists after MCP refresh (#1612).
+            agent.tools = [
+                t
+                for t in agent.tools
+                if isinstance(t, dict) and t.get("function", {}).get("name") in exact
+            ]
+            agent.valid_tool_names = {
+                t["function"]["name"] for t in agent.tools if isinstance(t, dict)
+            }
+            new_names = set(agent.valid_tool_names)
         # Publish context-engine routing names atomically with the snapshot.
         engine_names = getattr(agent, "_context_engine_tool_names", None)
         if isinstance(engine_names, set):

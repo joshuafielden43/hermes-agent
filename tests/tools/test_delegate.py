@@ -71,11 +71,14 @@ class TestDelegateRequirements(unittest.TestCase):
         self.assertIn("goal", props)
         self.assertIn("tasks", props)
         self.assertIn("context", props)
-        # toolsets is intentionally NOT exposed to the model — subagents always
-        # inherit the parent's toolsets. Letting the model name toolsets was a
-        # capability-selection surface the model should not control.
+        # toolsets is intentionally NOT exposed to the model — use enabled_tools
+        # for a non-widening exact allowlist instead of coarse toolset names.
         self.assertNotIn("toolsets", props)
         self.assertNotIn("toolsets", props["tasks"]["items"]["properties"])
+        self.assertIn("enabled_tools", props)
+        self.assertIn("write_roots", props)
+        self.assertIn("enabled_tools", props["tasks"]["items"]["properties"])
+        self.assertIn("write_roots", props["tasks"]["items"]["properties"])
         # max_iterations is intentionally NOT exposed to the model — it's
         # config-authoritative via delegation.max_iterations so users get
         # predictable budgets.
