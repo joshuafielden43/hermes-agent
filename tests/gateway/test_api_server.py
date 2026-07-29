@@ -2841,8 +2841,12 @@ class TestResponsesStreaming:
     @pytest.mark.asyncio
     async def test_structured_chat_stream_withholds_invalid_text(self, adapter):
         app = _create_app(adapter)
+        agent = MagicMock()
+        agent._persist_disabled = True
         async with TestClient(TestServer(app)) as cli:
             async def _mock_run_agent(**kwargs):
+                assert kwargs["defer_persistence"] is True
+                kwargs["agent_ref"][0] = agent
                 kwargs["stream_delta_callback"]("not json")
                 return (
                     {"final_response": "not json", "messages": [], "api_calls": 1},
@@ -2861,12 +2865,55 @@ class TestResponsesStreaming:
         assert "not json" not in body
         assert "event: hermes.sidecar" not in body
         assert "structured_output_validation_failed" in body
+        assert agent._persist_disabled is True
+        agent._flush_messages_to_session_db.assert_not_called()
+        agent._sync_external_memory_for_turn.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_structured_chat_stream_commits_only_validated_text(self, adapter):
+        app = _create_app(adapter)
+        agent = MagicMock()
+        agent._persist_disabled = True
+        async with TestClient(TestServer(app)) as cli:
+            async def _mock_run_agent(**kwargs):
+                assert kwargs["defer_persistence"] is True
+                kwargs["agent_ref"][0] = agent
+                kwargs["stream_delta_callback"]('{"answer": 42}')
+                return (
+                    {
+                        "final_response": '{"answer": 42}',
+                        "messages": [
+                            {"role": "user", "content": "answer"},
+                            {"role": "assistant", "content": '{"answer": 42}'},
+                        ],
+                        "api_calls": 1,
+                    },
+                    {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+                )
+
+            with patch.object(adapter, "_run_agent", side_effect=_mock_run_agent):
+                resp = await cli.post("/v1/chat/completions", json={
+                    "model": "hermes-agent", "stream": True,
+                    "messages": [{"role": "user", "content": "answer"}],
+                    "response_format": {"type": "json_object"},
+                })
+                body = await resp.text()
+
+        assert resp.status == 200
+        assert '{\\"answer\\": 42}' in body
+        assert agent._persist_disabled is False
+        agent._flush_messages_to_session_db.assert_called_once()
+        agent._sync_external_memory_for_turn.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_structured_responses_stream_withholds_invalid_text(self, adapter):
         app = _create_app(adapter)
+        agent = MagicMock()
+        agent._persist_disabled = True
         async with TestClient(TestServer(app)) as cli:
             async def _mock_run_agent(**kwargs):
+                assert kwargs["defer_persistence"] is True
+                kwargs["agent_ref"][0] = agent
                 kwargs["stream_delta_callback"]("not json")
                 return (
                     {"final_response": "not json", "messages": [], "api_calls": 1},
@@ -2884,6 +2931,44 @@ class TestResponsesStreaming:
         assert "not json" not in body
         assert "event: response.failed" in body
         assert "structured_output_validation_failed" in body
+        assert agent._persist_disabled is True
+        agent._flush_messages_to_session_db.assert_not_called()
+        agent._sync_external_memory_for_turn.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_structured_responses_stream_commits_only_validated_text(self, adapter):
+        app = _create_app(adapter)
+        agent = MagicMock()
+        agent._persist_disabled = True
+        async with TestClient(TestServer(app)) as cli:
+            async def _mock_run_agent(**kwargs):
+                assert kwargs["defer_persistence"] is True
+                kwargs["agent_ref"][0] = agent
+                kwargs["stream_delta_callback"]('{"answer": 42}')
+                return (
+                    {
+                        "final_response": '{"answer": 42}',
+                        "messages": [
+                            {"role": "user", "content": "answer"},
+                            {"role": "assistant", "content": '{"answer": 42}'},
+                        ],
+                        "api_calls": 1,
+                    },
+                    {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+                )
+
+            with patch.object(adapter, "_run_agent", side_effect=_mock_run_agent):
+                resp = await cli.post("/v1/responses", json={
+                    "model": "hermes-agent", "input": "answer", "stream": True,
+                    "text": {"format": {"type": "json_object"}},
+                })
+                body = await resp.text()
+
+        assert resp.status == 200
+        assert "event: response.completed" in body
+        assert agent._persist_disabled is False
+        agent._flush_messages_to_session_db.assert_called_once()
+        agent._sync_external_memory_for_turn.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_stream_true_returns_responses_sse(self, adapter):

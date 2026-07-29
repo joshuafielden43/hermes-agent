@@ -3120,6 +3120,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 gateway_session_key=gateway_session_key,
                 route=route,
                 output_contract=output_contract,
+                defer_persistence=bool(output_contract),
             ))
             # Ensure SSE drain loops can terminate without relying on polling
             # agent_task.done(), which can race with queue timeout checks.
@@ -3130,6 +3131,8 @@ class APIServerAdapter(BasePlatformAdapter):
                 agent_task, agent_ref, session_id=session_id,
                 gateway_session_key=gateway_session_key,
                 output_contract=output_contract,
+                conversation_history=history,
+                user_message=user_message,
             )
 
         # Non-streaming: run the agent (with optional Idempotency-Key)
@@ -3267,6 +3270,8 @@ class APIServerAdapter(BasePlatformAdapter):
         self, request: "web.Request", completion_id: str, model: str,
         created: int, stream_q, agent_task, agent_ref=None, session_id: str = None,
         gateway_session_key: str = None, output_contract: Optional[Dict[str, Any]] = None,
+        conversation_history: Optional[List[Dict[str, Any]]] = None,
+        user_message: Any = None,
     ) -> "web.StreamResponse":
         """Write real streaming SSE from agent's stream_delta_callback queue.
 
@@ -3398,7 +3403,17 @@ class APIServerAdapter(BasePlatformAdapter):
             if output_contract and not is_failed and completed:
                 raw_output = result.get("final_response", "") if isinstance(result, dict) else ""
                 try:
-                    await _emit_content(_validated_structured_output(output_contract, raw_output or "".join(held_output)))
+                    normalized = _validated_structured_output(
+                        output_contract, raw_output or "".join(held_output)
+                    )
+                    result = self._validated_structured_result(result, normalized)
+                    await self._commit_validated_structured_turn(
+                        agent_ref[0] if agent_ref else None,
+                        result,
+                        conversation_history or [],
+                        user_message,
+                    )
+                    await _emit_content(normalized)
                 except StructuredOutputValidationError as exc:
                     structured_output_failed = True
                     is_failed = True
@@ -3898,6 +3913,15 @@ class APIServerAdapter(BasePlatformAdapter):
                         final_response_text = _validated_structured_output(
                             output_contract, agent_final or "".join(held_output)
                         )
+                        result = self._validated_structured_result(
+                            result, final_response_text
+                        )
+                        await self._commit_validated_structured_turn(
+                            agent_ref[0] if agent_ref else None,
+                            result,
+                            conversation_history,
+                            user_message,
+                        )
                         release_structured_output = True
                         await _emit_text_delta(final_response_text)
                     except StructuredOutputValidationError as exc:
@@ -4295,6 +4319,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 gateway_session_key=gateway_session_key,
                 route=route,
                 output_contract=output_contract,
+                defer_persistence=bool(output_contract),
             ))
             # Ensure SSE drain loops can terminate without relying on polling
             # agent_task.done(), which can race with queue timeout checks.
@@ -5018,6 +5043,52 @@ class APIServerAdapter(BasePlatformAdapter):
             async_delivery=False,
         )
 
+    @staticmethod
+    def _validated_structured_result(
+        result: Optional[Dict[str, Any]], normalized: str,
+    ) -> Dict[str, Any]:
+        """Replace only the original turn's final assistant text."""
+        clean = dict(result or {})
+        messages = clean.get("messages")
+        if isinstance(messages, list) and messages:
+            messages = [
+                dict(message) if isinstance(message, dict) else message
+                for message in messages
+            ]
+            for index in range(len(messages) - 1, -1, -1):
+                message = messages[index]
+                if isinstance(message, dict) and message.get("role") == "assistant":
+                    message["content"] = normalized
+                    break
+            clean["messages"] = messages
+        clean["final_response"] = normalized
+        return clean
+
+    @staticmethod
+    async def _commit_validated_structured_turn(
+        agent: Any,
+        result: Dict[str, Any],
+        conversation_history: List[Dict[str, Any]],
+        user_message: Any,
+    ) -> None:
+        messages = result.get("messages")
+        if agent is None or not isinstance(messages, list):
+            return
+
+        def _commit() -> None:
+            agent._persist_disabled = False
+            agent._session_messages = messages
+            agent._save_session_log(messages)
+            agent._flush_messages_to_session_db(messages, conversation_history)
+            agent._sync_external_memory_for_turn(
+                original_user_message=user_message,
+                final_response=result["final_response"],
+                interrupted=False,
+                messages=messages,
+            )
+
+        await asyncio.to_thread(_commit)
+
     async def _run_agent_with_structured_output_repair(
         self,
         *,
@@ -5087,36 +5158,10 @@ class APIServerAdapter(BasePlatformAdapter):
             }
             logger.info("Structured output repair succeeded (type=%s)", output_contract["type"])
 
-        result = dict(initial_result)
-        messages = result.get("messages")
-        if isinstance(messages, list) and messages:
-            messages = [
-                dict(message) if isinstance(message, dict) else message
-                for message in messages
-            ]
-            for index in range(len(messages) - 1, -1, -1):
-                message = messages[index]
-                if isinstance(message, dict) and message.get("role") == "assistant":
-                    message["content"] = normalized
-                    break
-            result["messages"] = messages
-        result["final_response"] = normalized
-
-        agent = initial_agent_ref[0]
-        if agent is not None and isinstance(result.get("messages"), list):
-            def _commit_validated_turn() -> None:
-                agent._persist_disabled = False
-                agent._session_messages = result["messages"]
-                agent._save_session_log(result["messages"])
-                agent._flush_messages_to_session_db(result["messages"], conversation_history)
-                agent._sync_external_memory_for_turn(
-                    original_user_message=user_message,
-                    final_response=normalized,
-                    interrupted=False,
-                    messages=result["messages"],
-                )
-
-            await asyncio.to_thread(_commit_validated_turn)
+        result = self._validated_structured_result(initial_result, normalized)
+        await self._commit_validated_structured_turn(
+            initial_agent_ref[0], result, conversation_history, user_message
+        )
         return result, usage
 
     async def _run_agent(
