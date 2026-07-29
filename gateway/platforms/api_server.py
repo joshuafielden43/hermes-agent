@@ -3400,7 +3400,10 @@ class APIServerAdapter(BasePlatformAdapter):
                 err_msg = err_msg or str(agent_error)
 
             structured_output_failed = False
-            if output_contract and not is_failed and completed:
+            if output_contract and (is_partial or is_failed or not completed or err_msg):
+                is_failed = True
+                err_msg = err_msg or "Agent run did not complete"
+            elif output_contract:
                 raw_output = result.get("final_response", "") if isinstance(result, dict) else ""
                 try:
                     normalized = _validated_structured_output(
@@ -3908,7 +3911,18 @@ class APIServerAdapter(BasePlatformAdapter):
                 result, agent_usage = await agent_task
                 usage = agent_usage or usage
                 agent_final = result.get("final_response", "") if isinstance(result, dict) else ""
-                if output_contract:
+                structured_run_failed = (
+                    not isinstance(result, dict)
+                    or bool(result.get("partial"))
+                    or bool(result.get("failed"))
+                    or not bool(result.get("completed", True))
+                    or bool(result.get("error"))
+                )
+                if output_contract and structured_run_failed:
+                    agent_error = _redact_api_error_text(
+                        result.get("error") or "Agent run did not complete"
+                    ) if isinstance(result, dict) else "Agent run did not complete"
+                elif output_contract:
                     try:
                         final_response_text = _validated_structured_output(
                             output_contract, agent_final or "".join(held_output)
@@ -5047,7 +5061,7 @@ class APIServerAdapter(BasePlatformAdapter):
     def _validated_structured_result(
         result: Optional[Dict[str, Any]], normalized: str,
     ) -> Dict[str, Any]:
-        """Replace only the original turn's final assistant text."""
+        """Canonicalize every persisted copy of the original final answer."""
         clean = dict(result or {})
         messages = clean.get("messages")
         if isinstance(messages, list) and messages:
@@ -5059,6 +5073,8 @@ class APIServerAdapter(BasePlatformAdapter):
                 message = messages[index]
                 if isinstance(message, dict) and message.get("role") == "assistant":
                     message["content"] = normalized
+                    message.pop("api_content", None)
+                    message.pop("codex_message_items", None)
                     break
             clean["messages"] = messages
         clean["final_response"] = normalized

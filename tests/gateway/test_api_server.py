@@ -2734,26 +2734,43 @@ class TestStructuredOutput:
     @pytest.mark.asyncio
     async def test_responses_repair_stores_only_the_original_turn_and_corrected_answer(self, adapter):
         app = _create_app(adapter)
+        agent = MagicMock()
+        agent._persist_disabled = True
         initial_messages = [
             {"role": "user", "content": "answer"},
-            {"role": "assistant", "content": "not json"},
+            {
+                "role": "assistant",
+                "content": "not json",
+                "api_content": "not json",
+                "codex_message_items": [{
+                    "type": "message",
+                    "role": "assistant",
+                    "phase": "final_answer",
+                    "content": [{"type": "output_text", "text": "not json"}],
+                }],
+            },
         ]
         repair_messages = initial_messages + [
             {"role": "user", "content": _STRUCTURED_OUTPUT_REPAIR_INSTRUCTION},
             {"role": "assistant", "content": '{"answer": 42}'},
         ]
+        results = iter((
+            (
+                {"final_response": "not json", "messages": initial_messages, "api_calls": 1},
+                {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+            ),
+            (
+                {"final_response": '{"answer": 42}', "messages": repair_messages, "api_calls": 1},
+                {"input_tokens": 3, "output_tokens": 4, "total_tokens": 7},
+            ),
+        ))
         async with TestClient(TestServer(app)) as cli:
-            with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
-                mock_run.side_effect = (
-                    (
-                        {"final_response": "not json", "messages": initial_messages, "api_calls": 1},
-                        {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
-                    ),
-                    (
-                        {"final_response": '{"answer": 42}', "messages": repair_messages, "api_calls": 1},
-                        {"input_tokens": 3, "output_tokens": 4, "total_tokens": 7},
-                    ),
-                )
+            async def _mock_run_agent(**kwargs):
+                if not kwargs.get("format_only"):
+                    kwargs["agent_ref"][0] = agent
+                return next(results)
+
+            with patch.object(adapter, "_run_agent", side_effect=_mock_run_agent):
                 resp = await cli.post("/v1/responses", json={
                     "model": "hermes-agent",
                     "input": "answer",
@@ -2767,6 +2784,10 @@ class TestStructuredOutput:
             {"role": "user", "content": "answer"},
             {"role": "assistant", "content": '{"answer": 42}'},
         ]
+        committed = agent._flush_messages_to_session_db.call_args.args[0]
+        assert committed[-1]["content"] == '{"answer": 42}'
+        assert "api_content" not in committed[-1]
+        assert "codex_message_items" not in committed[-1]
 
     @pytest.mark.asyncio
     async def test_invalid_structured_output_fails_after_one_repair_attempt(self, adapter):
@@ -2944,13 +2965,26 @@ class TestResponsesStreaming:
             async def _mock_run_agent(**kwargs):
                 assert kwargs["defer_persistence"] is True
                 kwargs["agent_ref"][0] = agent
-                kwargs["stream_delta_callback"]('{"answer": 42}')
+                kwargs["stream_delta_callback"]('```json\n{"answer": 42}\n```')
                 return (
                     {
-                        "final_response": '{"answer": 42}',
+                        "final_response": '```json\n{"answer": 42}\n```',
                         "messages": [
                             {"role": "user", "content": "answer"},
-                            {"role": "assistant", "content": '{"answer": 42}'},
+                            {
+                                "role": "assistant",
+                                "content": '```json\n{"answer": 42}\n```',
+                                "api_content": '```json\n{"answer": 42}\n```',
+                                "codex_message_items": [{
+                                    "type": "message",
+                                    "role": "assistant",
+                                    "phase": "final_answer",
+                                    "content": [{
+                                        "type": "output_text",
+                                        "text": '```json\n{"answer": 42}\n```',
+                                    }],
+                                }],
+                            },
                         ],
                         "api_calls": 1,
                     },
@@ -2969,6 +3003,48 @@ class TestResponsesStreaming:
         assert agent._persist_disabled is False
         agent._flush_messages_to_session_db.assert_called_once()
         agent._sync_external_memory_for_turn.assert_called_once()
+        committed = agent._flush_messages_to_session_db.call_args.args[0]
+        assert committed[-1]["content"] == '{"answer": 42}'
+        assert "api_content" not in committed[-1]
+        assert "codex_message_items" not in committed[-1]
+
+    @pytest.mark.asyncio
+    async def test_structured_responses_stream_never_commits_partial_valid_json(self, adapter):
+        app = _create_app(adapter)
+        agent = MagicMock()
+        agent._persist_disabled = True
+        async with TestClient(TestServer(app)) as cli:
+            async def _mock_run_agent(**kwargs):
+                assert kwargs["defer_persistence"] is True
+                kwargs["agent_ref"][0] = agent
+                kwargs["stream_delta_callback"]('{"answer": 42}')
+                return (
+                    {
+                        "final_response": '{"answer": 42}',
+                        "messages": [
+                            {"role": "user", "content": "answer"},
+                            {"role": "assistant", "content": '{"answer": 42}'},
+                        ],
+                        "completed": False,
+                        "partial": True,
+                        "error": "output truncated",
+                    },
+                    {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+                )
+
+            with patch.object(adapter, "_run_agent", side_effect=_mock_run_agent):
+                resp = await cli.post("/v1/responses", json={
+                    "model": "hermes-agent", "input": "answer", "stream": True,
+                    "text": {"format": {"type": "json_object"}},
+                })
+                body = await resp.text()
+
+        assert resp.status == 200
+        assert "event: response.failed" in body
+        assert "event: response.completed" not in body
+        assert agent._persist_disabled is True
+        agent._flush_messages_to_session_db.assert_not_called()
+        agent._sync_external_memory_for_turn.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_stream_true_returns_responses_sse(self, adapter):
