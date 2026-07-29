@@ -2912,6 +2912,83 @@ class TestStructuredOutput:
         }
 
     @pytest.mark.asyncio
+    async def test_failed_structured_suffix_keeps_prior_history(self, adapter):
+        prior = [
+            {"role": "user", "content": "old question"},
+            {"role": "assistant", "content": "old answer"},
+        ]
+        adapter._response_store.put("resp_suffix_prior", {
+            "response": {"id": "resp_suffix_prior", "status": "completed"},
+            "conversation_history": prior,
+            "session_id": "existing-session",
+        })
+        result = {
+            "final_response": "not json",
+            "messages": [{"role": "assistant", "content": "not json"}],
+            "failed": True,
+            "completed": False,
+            "error": "provider failed",
+        }
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
+                mock_run.return_value = (
+                    result,
+                    {"input_tokens": 1, "output_tokens": 0, "total_tokens": 1},
+                )
+                resp = await cli.post("/v1/responses", json={
+                    "model": "hermes-agent",
+                    "input": "new question",
+                    "previous_response_id": "resp_suffix_prior",
+                    "text": {"format": {"type": "json_object"}},
+                })
+                data = await resp.json()
+
+        stored_history = adapter._response_store.get(data["id"])["conversation_history"]
+        assert stored_history == prior + [
+            {"role": "user", "content": "new question"},
+            {"role": "assistant", "content": data["error"]["message"]},
+        ]
+        assert "not json" not in json.dumps(stored_history)
+
+    @pytest.mark.asyncio
+    async def test_failed_compressed_user_rewrite_keeps_prior_assistant(self, adapter):
+        compressed_messages = [
+            {"role": "user", "content": "[Compressed summary]"},
+            {"role": "assistant", "content": "preserved prior answer"},
+            {"role": "user", "content": "[Summary merged into]\nnew question"},
+        ]
+        result = {
+            "final_response": "",
+            "messages": compressed_messages,
+            "session_id": "compressed-session",
+            "_compressed": True,
+            "failed": True,
+            "completed": False,
+            "error": "provider failed",
+        }
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
+                mock_run.return_value = (
+                    result,
+                    {"input_tokens": 1, "output_tokens": 0, "total_tokens": 1},
+                )
+                resp = await cli.post("/v1/responses", json={
+                    "model": "hermes-agent",
+                    "input": "new question",
+                    "text": {"format": {"type": "json_object"}},
+                })
+                data = await resp.json()
+
+        stored_history = adapter._response_store.get(data["id"])["conversation_history"]
+        assert stored_history[:3] == compressed_messages
+        assert stored_history[-1] == {
+            "role": "assistant", "content": data["error"]["message"],
+        }
+        assert data["hermes"]["context"]["compressed"] is True
+
+    @pytest.mark.asyncio
     async def test_invalid_structured_output_is_repaired_before_returning_to_client(self, adapter):
         app = _create_app(adapter)
         async with TestClient(TestServer(app)) as cli:

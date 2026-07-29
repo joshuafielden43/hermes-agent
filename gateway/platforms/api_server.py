@@ -4428,43 +4428,29 @@ class APIServerAdapter(BasePlatformAdapter):
             if store:
                 result_messages = failure_result.get("messages")
                 if isinstance(result_messages, list) and result_messages:
-                    failed_history = [
+                    sanitized_messages = [
                         dict(item) if isinstance(item, dict) else item
                         for item in result_messages
                     ]
-                    turn_start = self._response_messages_turn_start_index(
-                        conversation_history, user_message, failure_result
-                    )
-                    for index in range(len(failed_history) - 1, -1, -1):
-                        item = failed_history[index]
-                        if (
-                            isinstance(item, dict)
-                            and item.get("role") == "user"
-                            and item.get("content") == user_message
-                        ):
-                            turn_start = max(turn_start, index + 1)
-                            break
-                    replaced = False
-                    for index in range(len(failed_history) - 1, turn_start - 1, -1):
-                        item = failed_history[index]
-                        if (
-                            isinstance(item, dict)
-                            and item.get("role") == "assistant"
-                            and item.get("content")
-                        ):
-                            item["content"] = safe_message
-                            item.pop("api_content", None)
-                            item.pop("codex_message_items", None)
-                            replaced = True
-                            break
-                    if not replaced:
-                        failed_history.append({"role": "assistant", "content": safe_message})
+                    tail = sanitized_messages[-1]
+                    if isinstance(tail, dict) and tail.get("role") == "assistant":
+                        tail["content"] = safe_message
+                        tail.pop("api_content", None)
+                        tail.pop("codex_message_items", None)
+                    else:
+                        sanitized_messages.append({
+                            "role": "assistant", "content": safe_message,
+                        })
+                    sanitized_result = dict(failure_result)
+                    sanitized_result["messages"] = sanitized_messages
                 else:
-                    failed_history = list(conversation_history)
-                    failed_history.extend((
-                        {"role": "user", "content": user_message},
-                        {"role": "assistant", "content": safe_message},
-                    ))
+                    sanitized_result = failure_result
+                failed_history = self._build_response_conversation_history(
+                    conversation_history,
+                    user_message,
+                    sanitized_result,
+                    safe_message,
+                )
                 self._response_store.put(response_id, {
                     "response": failed_data,
                     "conversation_history": failed_history,
