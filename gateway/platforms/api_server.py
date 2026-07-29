@@ -864,6 +864,16 @@ def _redact_api_error_text(value: Any, *, limit: int | None = None) -> str:
     return redacted
 
 
+def _structured_run_error(result: Any) -> Optional[str]:
+    """Return a safe error unless a structured-output run fully completed."""
+    if not isinstance(result, dict):
+        return "Agent run did not complete"
+    error = result.get("error")
+    if result.get("partial") or result.get("failed") or not result.get("completed", True) or error:
+        return _redact_api_error_text(error or "Agent run did not complete")
+    return None
+
+
 def _openai_error(message: str, err_type: str = "invalid_request_error", param: str = None, code: str = None) -> Dict[str, Any]:
     """OpenAI-style error envelope."""
     return {
@@ -3400,9 +3410,10 @@ class APIServerAdapter(BasePlatformAdapter):
                 err_msg = err_msg or str(agent_error)
 
             structured_output_failed = False
-            if output_contract and (is_partial or is_failed or not completed or err_msg):
+            structured_run_error = _structured_run_error(result)
+            if output_contract and structured_run_error:
                 is_failed = True
-                err_msg = err_msg or "Agent run did not complete"
+                err_msg = structured_run_error
             elif output_contract:
                 raw_output = result.get("final_response", "") if isinstance(result, dict) else ""
                 try:
@@ -3911,17 +3922,9 @@ class APIServerAdapter(BasePlatformAdapter):
                 result, agent_usage = await agent_task
                 usage = agent_usage or usage
                 agent_final = result.get("final_response", "") if isinstance(result, dict) else ""
-                structured_run_failed = (
-                    not isinstance(result, dict)
-                    or bool(result.get("partial"))
-                    or bool(result.get("failed"))
-                    or not bool(result.get("completed", True))
-                    or bool(result.get("error"))
-                )
-                if output_contract and structured_run_failed:
-                    agent_error = _redact_api_error_text(
-                        result.get("error") or "Agent run did not complete"
-                    ) if isinstance(result, dict) else "Agent run did not complete"
+                structured_run_error = _structured_run_error(result)
+                if output_contract and structured_run_error:
+                    agent_error = structured_run_error
                 elif output_contract:
                     try:
                         final_response_text = _validated_structured_output(
@@ -5139,6 +5142,9 @@ class APIServerAdapter(BasePlatformAdapter):
             return result, usage
 
         initial_result = result
+        run_error = _structured_run_error(result)
+        if run_error:
+            raise StructuredOutputValidationError(run_error)
         raw_response = _resolve_media_to_data_urls(result.get("final_response") or "")
         try:
             normalized = _validated_structured_output(output_contract, raw_response)
@@ -5166,6 +5172,9 @@ class APIServerAdapter(BasePlatformAdapter):
                 output_contract=output_contract,
                 format_only=True,
             )
+            repair_error = _structured_run_error(repair_result)
+            if repair_error:
+                raise StructuredOutputValidationError(repair_error)
             raw_response = _resolve_media_to_data_urls(repair_result.get("final_response") or "")
             normalized = _validated_structured_output(output_contract, raw_response)
             usage = {

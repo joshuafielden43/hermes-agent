@@ -2790,6 +2790,97 @@ class TestStructuredOutput:
         assert "codex_message_items" not in committed[-1]
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(("path", "payload"), (
+        ("/v1/chat/completions", {
+            "model": "hermes-agent",
+            "messages": [{"role": "user", "content": "answer"}],
+            "response_format": {"type": "json_object"},
+        }),
+        ("/v1/responses", {
+            "model": "hermes-agent",
+            "input": "answer",
+            "text": {"format": {"type": "json_object"}},
+        }),
+    ))
+    async def test_partial_valid_structured_batch_never_commits(self, adapter, path, payload):
+        app = _create_app(adapter)
+        agent = MagicMock()
+        agent._persist_disabled = True
+        calls = 0
+
+        async def _mock_run_agent(**kwargs):
+            nonlocal calls
+            calls += 1
+            kwargs["agent_ref"][0] = agent
+            return (
+                {
+                    "final_response": '{"answer": 42}',
+                    "messages": [
+                        {"role": "user", "content": "answer"},
+                        {"role": "assistant", "content": '{"answer": 42}'},
+                    ],
+                    "completed": False,
+                    "partial": True,
+                    "error": "output truncated",
+                },
+                {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+            )
+
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_run_agent", side_effect=_mock_run_agent):
+                resp = await cli.post(path, json=payload)
+                error = await resp.json()
+
+        assert resp.status == 502
+        assert error["error"]["code"] == "structured_output_validation_failed"
+        assert calls == 1
+        assert agent._persist_disabled is True
+        agent._flush_messages_to_session_db.assert_not_called()
+        agent._sync_external_memory_for_turn.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_partial_valid_repair_never_commits(self, adapter):
+        app = _create_app(adapter)
+        agent = MagicMock()
+        agent._persist_disabled = True
+        results = iter((
+            (
+                {"final_response": "not json", "messages": [], "api_calls": 1},
+                {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+            ),
+            (
+                {
+                    "final_response": '{"answer": 42}',
+                    "messages": [],
+                    "completed": False,
+                    "partial": True,
+                    "error": "output truncated",
+                },
+                {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+            ),
+        ))
+
+        async def _mock_run_agent(**kwargs):
+            if not kwargs.get("format_only"):
+                kwargs["agent_ref"][0] = agent
+            return next(results)
+
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_run_agent", side_effect=_mock_run_agent):
+                resp = await cli.post("/v1/chat/completions", json={
+                    "model": "hermes-agent",
+                    "messages": [{"role": "user", "content": "answer"}],
+                    "response_format": {"type": "json_object"},
+                })
+                error = await resp.json()
+
+        assert resp.status == 502
+        assert error["error"]["code"] == "structured_output_validation_failed"
+        assert agent._persist_disabled is True
+        agent._flush_messages_to_session_db.assert_not_called()
+        agent._sync_external_memory_for_turn.assert_not_called()
+
+    @pytest.mark.asyncio
     async def test_invalid_structured_output_fails_after_one_repair_attempt(self, adapter):
         app = _create_app(adapter)
         async with TestClient(TestServer(app)) as cli:
