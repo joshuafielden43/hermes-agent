@@ -2752,6 +2752,20 @@ class TestStructuredOutput:
             "validated": True,
         }
 
+    def test_route_capability_reads_config_without_runtime_resolution(self, adapter):
+        with (
+            patch("gateway.run._load_gateway_config", return_value={
+                "model": {"provider": "openai", "default": "gpt-test"},
+            }),
+            patch("gateway.run._resolve_runtime_agent_kwargs") as runtime_resolver,
+            patch("agent.models_dev.get_model_info", return_value=MagicMock(
+                structured_output=True,
+            )),
+        ):
+            assert adapter._strict_structured_output_supported(None) is True
+
+        runtime_resolver.assert_not_called()
+
     @pytest.mark.asyncio
     async def test_failed_strict_response_persists_terminal_sidecar(self, adapter):
         app = _create_app(adapter)
@@ -2792,6 +2806,65 @@ class TestStructuredOutput:
         assert "not json" not in public_record
         for forbidden in ("codex_reasoning_items", "encrypted_content", "api_key", "base_url"):
             assert forbidden not in public_record
+
+    @pytest.mark.asyncio
+    async def test_failed_structured_response_preserves_rotation_context(self, adapter):
+        adapter._response_store.put("resp_before_rotation", {
+            "response": {"id": "resp_before_rotation", "status": "completed"},
+            "conversation_history": [{"role": "user", "content": "earlier"}],
+            "session_id": "parent-session",
+        })
+        compressed_messages = [
+            {"role": "user", "content": "[Compressed summary]"},
+            {"role": "user", "content": "answer"},
+            {
+                "role": "assistant",
+                "content": "not json",
+                "api_content": "not json",
+                "codex_message_items": [{
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "not json"}],
+                }],
+            },
+        ]
+        result = {
+            "final_response": "not json",
+            "messages": compressed_messages,
+            "session_id": "rotated-child-session",
+            "_compressed": True,
+            "api_calls": 1,
+        }
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
+                mock_run.return_value = (
+                    result,
+                    {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+                )
+                resp = await cli.post("/v1/responses", json={
+                    "model": "hermes-agent",
+                    "input": "answer",
+                    "previous_response_id": "resp_before_rotation",
+                    "text": {"format": {"type": "json_object"}},
+                })
+                data = await resp.json()
+
+        stored = adapter._response_store.get(data["id"])
+        assert resp.status == 502
+        assert resp.headers["X-Hermes-Session-Id"] == "rotated-child-session"
+        assert data["hermes"]["context"] == {
+            "session_id": "rotated-child-session",
+            "continuation": "previous_response_id",
+            "compressed": True,
+        }
+        assert stored["session_id"] == "rotated-child-session"
+        assert stored["conversation_history"][0]["content"] == "[Compressed summary]"
+        assert stored["conversation_history"][-1]["content"] == data["error"]["message"]
+        persisted = json.dumps(stored)
+        assert "not json" not in persisted
+        assert "api_content" not in persisted
+        assert "codex_message_items" not in persisted
 
     @pytest.mark.asyncio
     async def test_invalid_structured_output_is_repaired_before_returning_to_client(self, adapter):

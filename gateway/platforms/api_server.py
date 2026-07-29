@@ -102,6 +102,10 @@ logger = logging.getLogger(__name__)
 class StructuredOutputValidationError(ValueError):
     """The provider returned text that does not meet the requested contract."""
 
+    def __init__(self, message: str, *, result: Optional[Dict[str, Any]] = None):
+        super().__init__(message)
+        self.result = result
+
 
 def _deny_schema_retrieval(uri: str):
     raise NoSuchResource(ref=uri)
@@ -1954,16 +1958,13 @@ class APIServerAdapter(BasePlatformAdapter):
     def _strict_structured_output_supported(self, route: Optional[Dict[str, Any]]) -> bool:
         """Return whether the configured route advertises strict JSON support."""
         from agent.models_dev import get_model_info
-        from gateway.run import _resolve_gateway_model, _resolve_runtime_agent_kwargs
+        from gateway.run import _load_gateway_config, _resolve_gateway_model
 
-        runtime: Dict[str, Any] = {}
-        if not route or not route.get("provider") or not route.get("model"):
-            try:
-                runtime = _resolve_runtime_agent_kwargs()
-            except RuntimeError:
-                return False
-        provider = (route or {}).get("provider") or runtime.get("provider")
-        model = (route or {}).get("model") or _resolve_gateway_model()
+        config = _load_gateway_config()
+        model_config = config.get("model", {}) if isinstance(config, dict) else {}
+        configured_provider = model_config.get("provider") if isinstance(model_config, dict) else None
+        provider = (route or {}).get("provider") or configured_provider
+        model = (route or {}).get("model") or _resolve_gateway_model(config)
         info = get_model_info(str(provider or ""), str(model or ""))
         return bool(info and info.structured_output)
 
@@ -1971,10 +1972,8 @@ class APIServerAdapter(BasePlatformAdapter):
         """Return the gateway's session ``/model`` override for *session_key*, if any.
 
         The gateway tracks per-session ``/model`` switches in
-        ``GatewayRunner._session_model_overrides``.  API-server requests that
-        share such a session key must keep honouring the explicit session
-        override even when the request's ``model`` field matches a configured
-        route — a user-issued ``/model`` always wins over static config.
+        ``GatewayRunner._session_model_overrides``. It applies only when the
+        HTTP request omits ``model``; an explicit configured HTTP model wins.
         """
         if not session_key:
             return None
@@ -2018,9 +2017,8 @@ class APIServerAdapter(BasePlatformAdapter):
         — matching the semantics of the native gateway's ``session_key``.
 
         ``route`` is an optional ``model_routes`` entry (per-client model
-        routing).  When set — and no session ``/model`` override exists for
-        this session — its model/provider/api_key/base_url override the
-        global defaults for this agent instance only.
+        routing). When set, its model/provider/api_key/base_url override the
+        global defaults and any session ``/model`` state for this request.
         """
         from run_agent import AIAgent
         from gateway.run import (
@@ -4394,6 +4392,11 @@ class APIServerAdapter(BasePlatformAdapter):
             message: Any, *, status: int, code: str, validated: bool,
         ) -> "web.Response":
             safe_message = _redact_api_error_text(message)
+            failure_result = getattr(message, "result", None)
+            if not isinstance(failure_result, dict):
+                failure_result = {}
+            effective_session_id = failure_result.get("session_id") or session_id
+            compressed = bool(failure_result.get("_compressed"))
             failed_data = {
                 "id": response_id,
                 "object": "response",
@@ -4404,26 +4407,31 @@ class APIServerAdapter(BasePlatformAdapter):
                 **_openai_error(safe_message, err_type="server_error", code=code),
             }
             failed_data["hermes"] = _hermes_sidecar(
-                session_id=session_id,
+                session_id=effective_session_id,
                 contract=output_contract,
+                compressed=compressed,
                 validated=validated,
                 **sidecar_context,
             )
             if store:
-                failed_history = list(conversation_history)
-                failed_history.extend((
-                    {"role": "user", "content": user_message},
-                    {"role": "assistant", "content": safe_message},
-                ))
+                failed_history = self._validated_structured_result(
+                    failure_result, safe_message
+                ).get("messages")
+                if not isinstance(failed_history, list) or not failed_history:
+                    failed_history = list(conversation_history)
+                    failed_history.extend((
+                        {"role": "user", "content": user_message},
+                        {"role": "assistant", "content": safe_message},
+                    ))
                 self._response_store.put(response_id, {
                     "response": failed_data,
                     "conversation_history": failed_history,
                     "instructions": instructions,
-                    "session_id": session_id,
+                    "session_id": effective_session_id,
                 })
                 if conversation:
                     self._response_store.set_conversation(conversation, response_id)
-            headers = {"X-Hermes-Session-Id": session_id}
+            headers = {"X-Hermes-Session-Id": effective_session_id}
             if gateway_session_key:
                 headers["X-Hermes-Session-Key"] = gateway_session_key
             return web.json_response(failed_data, status=status, headers=headers)
@@ -4480,7 +4488,10 @@ class APIServerAdapter(BasePlatformAdapter):
             final_response = _validated_structured_output(output_contract, final_response)
         except StructuredOutputValidationError as exc:
             return _failed_response(
-                exc, status=502, code="structured_output_validation_failed", validated=False
+                StructuredOutputValidationError(str(exc), result=result),
+                status=502,
+                code="structured_output_validation_failed",
+                validated=False,
             )
         if output_contract:
             result = dict(result)
@@ -5208,7 +5219,7 @@ class APIServerAdapter(BasePlatformAdapter):
         initial_result = result
         run_error = _structured_run_error(result)
         if run_error:
-            raise StructuredOutputValidationError(run_error)
+            raise StructuredOutputValidationError(run_error, result=initial_result)
         raw_response = _resolve_media_to_data_urls(result.get("final_response") or "")
         try:
             normalized = _validated_structured_output(output_contract, raw_response)
@@ -5238,9 +5249,14 @@ class APIServerAdapter(BasePlatformAdapter):
             )
             repair_error = _structured_run_error(repair_result)
             if repair_error:
-                raise StructuredOutputValidationError(repair_error)
+                raise StructuredOutputValidationError(repair_error, result=initial_result)
             raw_response = _resolve_media_to_data_urls(repair_result.get("final_response") or "")
-            normalized = _validated_structured_output(output_contract, raw_response)
+            try:
+                normalized = _validated_structured_output(output_contract, raw_response)
+            except StructuredOutputValidationError as exc:
+                raise StructuredOutputValidationError(
+                    str(exc), result=initial_result
+                ) from exc
             usage = {
                 key: (usage.get(key, 0) or 0) + (repair_usage.get(key, 0) or 0)
                 for key in ("input_tokens", "output_tokens", "total_tokens")
