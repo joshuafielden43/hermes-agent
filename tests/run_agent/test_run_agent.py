@@ -779,6 +779,15 @@ class TestSessionJsonSnapshotOptIn:
         # No session_*.json must appear under logs_dir.
         assert list(tmp_path.glob("session_*.json")) == []
 
+    def test_save_session_log_noops_when_persistence_is_deferred(self, agent, tmp_path):
+        agent._session_json_enabled = True
+        agent._persist_disabled = True
+        agent.logs_dir = tmp_path
+
+        agent._save_session_log([{"role": "assistant", "content": "not validated"}])
+
+        assert list(tmp_path.glob("session_*.json")) == []
+
     def test_save_session_log_writes_when_enabled(self, agent, tmp_path):
         # Opt-in path: with the flag on and a session_id, the writer must
         # produce ``session_{sid}.json`` under logs_dir.

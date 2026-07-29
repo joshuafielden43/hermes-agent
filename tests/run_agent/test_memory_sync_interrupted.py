@@ -68,6 +68,19 @@ class TestSyncExternalMemoryForTurn:
         )
         agent._memory_manager.sync_all.assert_not_called()
 
+    def test_persist_disabled_turn_does_not_sync(self):
+        agent = _bare_agent()
+        agent._persist_disabled = True
+
+        agent._sync_external_memory_for_turn(
+            original_user_message="answer",
+            final_response="not validated",
+            interrupted=False,
+        )
+
+        agent._memory_manager.sync_all.assert_not_called()
+        agent._memory_manager.queue_prefetch_all.assert_not_called()
+
     # --- Normal completed turn still syncs ------------------------------
 
     def test_completed_turn_syncs_and_queues_prefetch(self):

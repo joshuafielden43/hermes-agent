@@ -2706,6 +2706,8 @@ class AIAgent:
         fewer messages") is preserved so resume + branch don't clobber a
         fuller existing snapshot.
         """
+        if getattr(self, "_persist_disabled", False):
+            return
         if not getattr(self, "_session_json_enabled", False):
             return
         messages = messages or self._session_messages
@@ -3535,7 +3537,7 @@ class AIAgent:
         providers are strictly best-effort — a misconfigured or offline
         backend must not block the user from seeing their response.
         """
-        if interrupted:
+        if getattr(self, "_persist_disabled", False) or interrupted:
             return
         if not (self._memory_manager and final_response and original_user_message):
             return

@@ -2722,6 +2722,7 @@ class TestStructuredOutput:
         assert data["choices"][0]["message"]["content"] == '{"answer": 42}'
         assert data["usage"] == {"prompt_tokens": 4, "completion_tokens": 5, "total_tokens": 9}
         assert mock_run.await_count == 2
+        assert mock_run.await_args_list[0].kwargs["defer_persistence"] is True
         repair = mock_run.await_args_list[1].kwargs
         assert repair["user_message"] == _STRUCTURED_OUTPUT_REPAIR_INSTRUCTION
         assert repair["conversation_history"] == [
@@ -2729,6 +2730,43 @@ class TestStructuredOutput:
             {"role": "assistant", "content": "not json"},
         ]
         assert repair["format_only"] is True
+
+    @pytest.mark.asyncio
+    async def test_responses_repair_stores_only_the_original_turn_and_corrected_answer(self, adapter):
+        app = _create_app(adapter)
+        initial_messages = [
+            {"role": "user", "content": "answer"},
+            {"role": "assistant", "content": "not json"},
+        ]
+        repair_messages = initial_messages + [
+            {"role": "user", "content": _STRUCTURED_OUTPUT_REPAIR_INSTRUCTION},
+            {"role": "assistant", "content": '{"answer": 42}'},
+        ]
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
+                mock_run.side_effect = (
+                    (
+                        {"final_response": "not json", "messages": initial_messages, "api_calls": 1},
+                        {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+                    ),
+                    (
+                        {"final_response": '{"answer": 42}', "messages": repair_messages, "api_calls": 1},
+                        {"input_tokens": 3, "output_tokens": 4, "total_tokens": 7},
+                    ),
+                )
+                resp = await cli.post("/v1/responses", json={
+                    "model": "hermes-agent",
+                    "input": "answer",
+                    "text": {"format": {"type": "json_object"}},
+                })
+                data = await resp.json()
+
+        assert resp.status == 200
+        stored = adapter._response_store.get(data["id"])
+        assert stored["conversation_history"] == [
+            {"role": "user", "content": "answer"},
+            {"role": "assistant", "content": '{"answer": 42}'},
+        ]
 
     @pytest.mark.asyncio
     async def test_invalid_structured_output_fails_after_one_repair_attempt(self, adapter):
@@ -4776,6 +4814,28 @@ class TestModelRoutesHandlers:
 
 
 class TestModelRoutesAgentCreation:
+    def test_deferred_structured_agent_keeps_runtime_context_but_cannot_persist(self, monkeypatch):
+        captured = {}
+
+        class FakeAgent:
+            def __init__(self, **kwargs):
+                captured.update(kwargs)
+                self.request_overrides = {}
+                self._persist_disabled = False
+
+        _patch_create_agent_runtime(monkeypatch, captured, FakeAgent)
+        monkeypatch.setattr("hermes_cli.tools_config._get_platform_tools", lambda *_: {"web"})
+        session_db = object()
+        adapter = _make_routing_adapter({})
+        monkeypatch.setattr(adapter, "_ensure_session_db", lambda: session_db)
+
+        agent = adapter._create_agent(defer_persistence=True)
+
+        assert captured["enabled_toolsets"] == ["web"]
+        assert captured["session_db"] is session_db
+        assert captured["skip_memory"] is False
+        assert agent._persist_disabled is True
+
     def test_format_only_agent_disables_tools_fallback_and_persistence(self, monkeypatch):
         captured = {}
 

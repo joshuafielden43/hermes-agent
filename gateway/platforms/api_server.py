@@ -1979,6 +1979,7 @@ class APIServerAdapter(BasePlatformAdapter):
         route: Optional[Dict[str, Any]] = None,
         output_contract: Optional[Dict[str, Any]] = None,
         format_only: bool = False,
+        defer_persistence: bool = False,
     ) -> Any:
         """
         Create an AIAgent instance using the gateway's runtime config.
@@ -2100,7 +2101,7 @@ class APIServerAdapter(BasePlatformAdapter):
             gateway_session_key=gateway_session_key,
             skip_memory=format_only,
         )
-        if format_only:
+        if format_only or defer_persistence:
             agent._persist_disabled = True
         if output_contract:
             overrides = dict(getattr(agent, "request_overrides", {}) or {})
@@ -5035,6 +5036,7 @@ class APIServerAdapter(BasePlatformAdapter):
         non-streaming result gets one internal correction turn rather than
         forcing the client to resubmit the entire request.
         """
+        initial_agent_ref = [None]
         result, usage = await self._run_agent(
             user_message=user_message,
             conversation_history=conversation_history,
@@ -5043,10 +5045,13 @@ class APIServerAdapter(BasePlatformAdapter):
             gateway_session_key=gateway_session_key,
             route=route,
             output_contract=output_contract,
+            agent_ref=initial_agent_ref,
+            defer_persistence=bool(output_contract),
         )
         if not output_contract:
             return result, usage
 
+        initial_result = result
         raw_response = _resolve_media_to_data_urls(result.get("final_response") or "")
         try:
             normalized = _validated_structured_output(output_contract, raw_response)
@@ -5064,7 +5069,7 @@ class APIServerAdapter(BasePlatformAdapter):
             repair_system_prompt = "\n\n".join(
                 prompt for prompt in (ephemeral_system_prompt, _STRUCTURED_OUTPUT_REPAIR_INSTRUCTION) if prompt
             )
-            result, repair_usage = await self._run_agent(
+            repair_result, repair_usage = await self._run_agent(
                 user_message=_STRUCTURED_OUTPUT_REPAIR_INSTRUCTION,
                 conversation_history=repair_history,
                 ephemeral_system_prompt=repair_system_prompt,
@@ -5074,7 +5079,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 output_contract=output_contract,
                 format_only=True,
             )
-            raw_response = _resolve_media_to_data_urls(result.get("final_response") or "")
+            raw_response = _resolve_media_to_data_urls(repair_result.get("final_response") or "")
             normalized = _validated_structured_output(output_contract, raw_response)
             usage = {
                 key: (usage.get(key, 0) or 0) + (repair_usage.get(key, 0) or 0)
@@ -5082,8 +5087,36 @@ class APIServerAdapter(BasePlatformAdapter):
             }
             logger.info("Structured output repair succeeded (type=%s)", output_contract["type"])
 
-        result = dict(result)
+        result = dict(initial_result)
+        messages = result.get("messages")
+        if isinstance(messages, list) and messages:
+            messages = [
+                dict(message) if isinstance(message, dict) else message
+                for message in messages
+            ]
+            for index in range(len(messages) - 1, -1, -1):
+                message = messages[index]
+                if isinstance(message, dict) and message.get("role") == "assistant":
+                    message["content"] = normalized
+                    break
+            result["messages"] = messages
         result["final_response"] = normalized
+
+        agent = initial_agent_ref[0]
+        if agent is not None and isinstance(result.get("messages"), list):
+            def _commit_validated_turn() -> None:
+                agent._persist_disabled = False
+                agent._session_messages = result["messages"]
+                agent._save_session_log(result["messages"])
+                agent._flush_messages_to_session_db(result["messages"], conversation_history)
+                agent._sync_external_memory_for_turn(
+                    original_user_message=user_message,
+                    final_response=normalized,
+                    interrupted=False,
+                    messages=result["messages"],
+                )
+
+            await asyncio.to_thread(_commit_validated_turn)
         return result, usage
 
     async def _run_agent(
@@ -5101,6 +5134,7 @@ class APIServerAdapter(BasePlatformAdapter):
         route: Optional[Dict[str, Any]] = None,
         output_contract: Optional[Dict[str, Any]] = None,
         format_only: bool = False,
+        defer_persistence: bool = False,
     ) -> tuple:
         """
         Create an agent and run a conversation in a thread executor.
@@ -5144,6 +5178,7 @@ class APIServerAdapter(BasePlatformAdapter):
                         route=route,
                         output_contract=output_contract,
                         format_only=format_only,
+                        defer_persistence=defer_persistence,
                     )
                     if agent_ref is not None:
                         agent_ref[0] = agent
