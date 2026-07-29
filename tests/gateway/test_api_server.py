@@ -28,11 +28,13 @@ from gateway.config import GatewayConfig, Platform, PlatformConfig
 from gateway.platforms.api_server import (
     APIServerAdapter,
     ResponseStore,
+    StructuredOutputValidationError,
     _IdempotencyCache,
     _derive_chat_session_id,
     _hermes_version,
     _redact_api_error_text,
     _STRUCTURED_OUTPUT_REPAIR_INSTRUCTION,
+    _validated_structured_output,
     check_api_server_requirements,
     cors_middleware,
     security_headers_middleware,
@@ -2679,7 +2681,12 @@ class TestStructuredOutput:
                     "input": "answer",
                     "text": {"format": {
                         "type": "json_schema", "name": "answer",
-                        "schema": {"type": "object", "required": ["answer"]},
+                        "schema": {
+                            "$defs": {"answer": {"type": "integer"}},
+                            "type": "object",
+                            "properties": {"answer": {"$ref": "#/$defs/answer"}},
+                            "required": ["answer"],
+                        },
                     }},
                 })
                 data = await resp.json()
@@ -2759,6 +2766,37 @@ class TestStructuredOutput:
 
         assert resp.status == 400
         assert error["error"]["code"] == "structured_output_unsupported"
+
+    @pytest.mark.asyncio
+    async def test_external_schema_references_are_rejected_before_agent_run(self, adapter):
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
+                resp = await cli.post("/v1/chat/completions", json={
+                    "model": "hermes-agent",
+                    "messages": [{"role": "user", "content": "answer"}],
+                    "response_format": {"type": "json_schema", "json_schema": {
+                        "name": "answer",
+                        "schema": {"$ref": "http://127.0.0.1/private-schema.json"},
+                    }},
+                })
+                error = await resp.json()
+
+        assert resp.status == 400
+        assert error["error"]["code"] == "invalid_response_format"
+        assert "external references" in error["error"]["message"]
+        mock_run.assert_not_called()
+
+    def test_output_validation_never_retrieves_external_schema(self):
+        contract = {
+            "type": "json_schema",
+            "schema": {"$ref": "http://127.0.0.1/private-schema.json"},
+        }
+        with patch("urllib.request.urlopen") as urlopen:
+            with pytest.raises(StructuredOutputValidationError):
+                _validated_structured_output(contract, "{}")
+
+        urlopen.assert_not_called()
 
 
 class TestResponsesStreaming:
@@ -4732,6 +4770,10 @@ class TestModelRoutesHandlers:
                 assert resp.status == 400
                 assert (await resp.json())["error"]["code"] == "invalid_model"
 
+        assert adapter._run_statuses == {}
+        assert adapter._run_streams == {}
+        assert adapter._run_approval_sessions == {}
+
 
 class TestModelRoutesAgentCreation:
     def test_format_only_agent_disables_tools_fallback_and_persistence(self, monkeypatch):
@@ -4759,6 +4801,7 @@ class TestModelRoutesAgentCreation:
         assert captured["enabled_toolsets"] == []
         assert captured["fallback_model"] is None
         assert captured["session_db"] is None
+        assert captured["skip_memory"] is True
         assert agent._persist_disabled is True
 
     def test_strict_output_disables_fallback(self, monkeypatch):

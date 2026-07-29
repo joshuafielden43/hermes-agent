@@ -58,6 +58,8 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import jsonschema
+from referencing import Registry
+from referencing.exceptions import NoSuchResource, Unresolvable
 
 # Sentinel returned by _resolve_request_profile when a /p/<profile>/ prefix
 # names a profile this gateway does not serve (→ 404). Distinct from None
@@ -101,6 +103,32 @@ class StructuredOutputValidationError(ValueError):
     """The provider returned text that does not meet the requested contract."""
 
 
+def _deny_schema_retrieval(uri: str):
+    raise NoSuchResource(ref=uri)
+
+
+_NO_RETRIEVAL_SCHEMA_REGISTRY = Registry(retrieve=_deny_schema_retrieval)
+
+
+def _reject_external_schema_references(schema: Dict[str, Any]) -> None:
+    """Keep caller-supplied schemas self-contained."""
+    pending: List[Any] = [schema]
+    while pending:
+        node = pending.pop()
+        if isinstance(node, dict):
+            for key, value in node.items():
+                if (
+                    key in {"$ref", "$dynamicRef"}
+                    and isinstance(value, str)
+                    and value
+                    and not value.startswith("#")
+                ):
+                    raise ValueError("JSON Schema external references are not supported")
+                pending.append(value)
+        elif isinstance(node, list):
+            pending.extend(node)
+
+
 def _structured_output_contract(value: Any, *, responses: bool) -> Optional[Dict[str, Any]]:
     """Normalize Chat ``response_format`` and Responses ``text.format``."""
     if value is None:
@@ -125,6 +153,7 @@ def _structured_output_contract(value: Any, *, responses: bool) -> Optional[Dict
         raise ValueError("json_schema requires string name and object schema")
     if not isinstance(strict, bool):
         raise ValueError("json_schema.strict must be a boolean")
+    _reject_external_schema_references(schema)
     try:
         jsonschema.Draft202012Validator.check_schema(schema)
     except jsonschema.SchemaError as exc:
@@ -158,8 +187,10 @@ def _validated_structured_output(contract: Optional[Dict[str, Any]], text: str) 
         raise StructuredOutputValidationError("model output was not a JSON object")
     if contract["type"] == "json_schema":
         try:
-            jsonschema.validate(parsed, contract["schema"])
-        except jsonschema.ValidationError as exc:
+            jsonschema.Draft202012Validator(
+                contract["schema"], registry=_NO_RETRIEVAL_SCHEMA_REGISTRY
+            ).validate(parsed)
+        except (jsonschema.ValidationError, Unresolvable) as exc:
             raise StructuredOutputValidationError("model output did not match the requested JSON Schema") from exc
     return json.dumps(parsed, ensure_ascii=False)
 
@@ -2067,6 +2098,7 @@ class APIServerAdapter(BasePlatformAdapter):
             fallback_model=fallback_model,
             reasoning_config=reasoning_config,
             gateway_session_key=gateway_session_key,
+            skip_memory=format_only,
         )
         if format_only:
             agent._persist_disabled = True
@@ -5297,6 +5329,12 @@ class APIServerAdapter(BasePlatformAdapter):
                         )
                     conversation_history.append({"role": msg["role"], "content": str(content)})
 
+        # Reject unknown models before allocating run, stream, status, or
+        # approval state for a request that will never execute.
+        route, route_error = self._route_for_request(body.get("model"))
+        if route_error is not None:
+            return route_error
+
         run_id = f"run_{uuid.uuid4().hex}"
         session_id = body.get("session_id") or stored_session_id or run_id
         # Approval queues gate host-side tool execution and must be isolated
@@ -5344,10 +5382,6 @@ class APIServerAdapter(BasePlatformAdapter):
             model=body.get("model", self._model_name),
         )
 
-        # Per-client model routing for /v1/runs (see model_routes).
-        route, route_error = self._route_for_request(body.get("model"))
-        if route_error is not None:
-            return route_error
         # Background task outlives the HTTP response (and thus the middleware
         # profile scope). Capture now and re-enter inside the task/executor.
         request_profile = _api_request_profile.get()
