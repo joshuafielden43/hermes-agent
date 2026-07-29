@@ -1947,6 +1947,7 @@ class APIServerAdapter(BasePlatformAdapter):
         gateway_session_key: Optional[str] = None,
         route: Optional[Dict[str, Any]] = None,
         output_contract: Optional[Dict[str, Any]] = None,
+        format_only: bool = False,
     ) -> Any:
         """
         Create an AIAgent instance using the gateway's runtime config.
@@ -2035,13 +2036,15 @@ class APIServerAdapter(BasePlatformAdapter):
             logger.debug("api_server session /model override active for %s", gateway_session_key or session_id)
 
         user_config = _load_gateway_config()
-        enabled_toolsets = sorted(_get_platform_tools(user_config, "api_server"))
+        enabled_toolsets = [] if format_only else sorted(
+            _get_platform_tools(user_config, "api_server")
+        )
 
         max_iterations = _current_max_iterations()
 
         # Load fallback provider chain so the API server platform has the
         # same fallback behaviour as Telegram/Discord/Slack (fixes #4954).
-        fallback_model = GatewayRunner._load_fallback_model()
+        fallback_model = None if format_only else GatewayRunner._load_fallback_model()
         if output_contract and output_contract.get("strict"):
             fallback_model = None
 
@@ -2060,11 +2063,13 @@ class APIServerAdapter(BasePlatformAdapter):
             tool_progress_callback=tool_progress_callback,
             tool_start_callback=tool_start_callback,
             tool_complete_callback=tool_complete_callback,
-            session_db=self._ensure_session_db(),
+            session_db=None if format_only else self._ensure_session_db(),
             fallback_model=fallback_model,
             reasoning_config=reasoning_config,
             gateway_session_key=gateway_session_key,
         )
+        if format_only:
+            agent._persist_disabled = True
         if output_contract:
             overrides = dict(getattr(agent, "request_overrides", {}) or {})
             if runtime_kwargs.get("api_mode") == "codex_responses":
@@ -3092,7 +3097,6 @@ class APIServerAdapter(BasePlatformAdapter):
                 agent_task, agent_ref, session_id=session_id,
                 gateway_session_key=gateway_session_key,
                 output_contract=output_contract,
-                sidecar_context=sidecar_context,
             )
 
         # Non-streaming: run the agent (with optional Idempotency-Key)
@@ -3230,7 +3234,6 @@ class APIServerAdapter(BasePlatformAdapter):
         self, request: "web.Request", completion_id: str, model: str,
         created: int, stream_q, agent_task, agent_ref=None, session_id: str = None,
         gateway_session_key: str = None, output_contract: Optional[Dict[str, Any]] = None,
-        sidecar_context: Optional[Dict[str, str]] = None,
     ) -> "web.StreamResponse":
         """Write real streaming SSE from agent's stream_delta_callback queue.
 
@@ -3367,14 +3370,6 @@ class APIServerAdapter(BasePlatformAdapter):
                     structured_output_failed = True
                     is_failed = True
                     err_msg = str(exc)
-
-            sidecar = _hermes_sidecar(
-                session_id=(result or {}).get("session_id", session_id), contract=output_contract,
-                compressed=bool((result or {}).get("_compressed")),
-                validated=not structured_output_failed,
-                **(sidecar_context or {"continuation": "new", "route": "default"}),
-            )
-            await response.write(f"event: hermes.sidecar\ndata: {json.dumps(sidecar)}\n\n".encode())
 
             # Decide finish_reason, matching the non-streaming logic: "length"
             # for truncation, "error" for failure, "stop" for normal completion.
@@ -5045,6 +5040,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 gateway_session_key=gateway_session_key,
                 route=route,
                 output_contract=output_contract,
+                format_only=True,
             )
             raw_response = _resolve_media_to_data_urls(result.get("final_response") or "")
             normalized = _validated_structured_output(output_contract, raw_response)
@@ -5072,6 +5068,7 @@ class APIServerAdapter(BasePlatformAdapter):
         gateway_session_key: Optional[str] = None,
         route: Optional[Dict[str, Any]] = None,
         output_contract: Optional[Dict[str, Any]] = None,
+        format_only: bool = False,
     ) -> tuple:
         """
         Create an agent and run a conversation in a thread executor.
@@ -5114,6 +5111,7 @@ class APIServerAdapter(BasePlatformAdapter):
                         gateway_session_key=gateway_session_key,
                         route=route,
                         output_contract=output_contract,
+                        format_only=format_only,
                     )
                     if agent_ref is not None:
                         agent_ref[0] = agent

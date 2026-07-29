@@ -2721,6 +2721,7 @@ class TestStructuredOutput:
             {"role": "user", "content": "answer"},
             {"role": "assistant", "content": "not json"},
         ]
+        assert repair["format_only"] is True
 
     @pytest.mark.asyncio
     async def test_invalid_structured_output_fails_after_one_repair_attempt(self, adapter):
@@ -2782,6 +2783,7 @@ class TestResponsesStreaming:
 
         assert resp.status == 200
         assert "not json" not in body
+        assert "event: hermes.sidecar" not in body
         assert "structured_output_validation_failed" in body
 
     @pytest.mark.asyncio
@@ -4732,6 +4734,33 @@ class TestModelRoutesHandlers:
 
 
 class TestModelRoutesAgentCreation:
+    def test_format_only_agent_disables_tools_fallback_and_persistence(self, monkeypatch):
+        captured = {}
+
+        class FakeAgent:
+            def __init__(self, **kwargs):
+                captured.update(kwargs)
+                self.request_overrides = {}
+                self._persist_disabled = False
+
+        _patch_create_agent_runtime(monkeypatch, captured, FakeAgent)
+        monkeypatch.setattr(
+            "gateway.run.GatewayRunner._load_fallback_model",
+            staticmethod(lambda: {"model": "fallback/model"}),
+        )
+        adapter = _make_routing_adapter({})
+        monkeypatch.setattr(adapter, "_ensure_session_db", lambda: object())
+
+        agent = adapter._create_agent(
+            output_contract={"provider_format": {"type": "json_object"}},
+            format_only=True,
+        )
+
+        assert captured["enabled_toolsets"] == []
+        assert captured["fallback_model"] is None
+        assert captured["session_db"] is None
+        assert agent._persist_disabled is True
+
     def test_strict_output_disables_fallback(self, monkeypatch):
         captured = {}
 
