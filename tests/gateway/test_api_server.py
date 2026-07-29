@@ -2042,6 +2042,9 @@ class TestResponsesEndpoint:
                 )
 
             assert resp2.status == 200
+            data2 = await resp2.json()
+            assert data1["hermes"]["context"]["continuation"] == "new"
+            assert data2["hermes"]["context"]["continuation"] == "previous_response_id"
             # The conversation_history should contain the full history from the first response
             call_kwargs = mock_run.call_args.kwargs
             assert len(call_kwargs["conversation_history"]) > 0
@@ -2232,6 +2235,11 @@ class TestResponsesEndpoint:
 
         # Response header must also reflect the rotated session
         assert resp.headers.get("X-Hermes-Session-Id") == "rotated-child-session"
+        assert data["hermes"]["context"] == {
+            "session_id": "rotated-child-session",
+            "continuation": "previous_response_id",
+            "compressed": True,
+        }
 
     @pytest.mark.asyncio
     async def test_inplace_compression_exercises_detection_and_persists_compressed_history(
@@ -2605,8 +2613,14 @@ class TestResponsesEndpoint:
                     "/v1/responses",
                     json={"model": "hermes-agent", "input": "Hello"},
                 )
+                data = await resp.json()
 
             assert resp.status == 500
+            assert data["status"] == "failed"
+            assert data["hermes"]["reasoning"] == {
+                "mode": "provider_managed", "exposed": False,
+            }
+            assert adapter._response_store.get(data["id"])["response"] == data
 
     @pytest.mark.asyncio
     async def test_result_error_fallback_is_redacted(self, adapter):
@@ -2647,6 +2661,11 @@ class TestResponsesEndpoint:
 
 
 class TestStructuredOutput:
+    @pytest.mark.parametrize("raw", ('{"value": NaN}', '{"value": Infinity}', '{"value": -Infinity}'))
+    def test_non_finite_numbers_are_not_valid_json(self, raw):
+        with pytest.raises(StructuredOutputValidationError):
+            _validated_structured_output({"type": "json_object"}, raw)
+
     @pytest.mark.asyncio
     async def test_chat_response_format_validates_and_normalizes_json(self, adapter):
         app = _create_app(adapter)
@@ -2694,7 +2713,85 @@ class TestStructuredOutput:
         assert resp.status == 200
         assert data["output"][-1]["content"][0]["text"] == '{"answer": 42}'
         assert data["hermes"]["output_contract"]["mode"] == "json_schema"
+        assert isinstance(data["hermes"]["output_contract"]["route_capable"], bool)
         assert data["hermes"]["reasoning"] == {"mode": "provider_managed", "exposed": False}
+
+    @pytest.mark.asyncio
+    async def test_strict_responses_sidecar_records_supported_route(self, adapter):
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with (
+                patch.object(adapter, "_strict_structured_output_supported", return_value=True),
+                patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run,
+            ):
+                mock_run.return_value = (
+                    {"final_response": '{"answer": 42}', "messages": [], "api_calls": 1},
+                    {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+                )
+                resp = await cli.post("/v1/responses", json={
+                    "model": "hermes-agent",
+                    "input": "answer",
+                    "text": {"format": {
+                        "type": "json_schema",
+                        "name": "answer",
+                        "strict": True,
+                        "schema": {
+                            "type": "object",
+                            "properties": {"answer": {"type": "integer"}},
+                            "required": ["answer"],
+                        },
+                    }},
+                })
+                data = await resp.json()
+
+        assert resp.status == 200
+        assert data["hermes"]["output_contract"] == {
+            "mode": "json_schema",
+            "strict": True,
+            "route_capable": True,
+            "validated": True,
+        }
+
+    @pytest.mark.asyncio
+    async def test_failed_strict_response_persists_terminal_sidecar(self, adapter):
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with (
+                patch.object(adapter, "_strict_structured_output_supported", return_value=True),
+                patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run,
+            ):
+                mock_run.return_value = (
+                    {"final_response": "not json", "messages": [], "api_calls": 1},
+                    {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+                )
+                resp = await cli.post("/v1/responses", json={
+                    "model": "hermes-agent",
+                    "input": "answer",
+                    "text": {"format": {
+                        "type": "json_schema",
+                        "name": "answer",
+                        "strict": True,
+                        "schema": {"type": "object"},
+                    }},
+                })
+                data = await resp.json()
+                stored = adapter._response_store.get(data["id"])
+                fetched = await (await cli.get(f"/v1/responses/{data['id']}")).json()
+
+        assert resp.status == 502
+        assert data["status"] == "failed"
+        assert data["error"]["code"] == "structured_output_validation_failed"
+        assert data["hermes"]["output_contract"] == {
+            "mode": "json_schema",
+            "strict": True,
+            "route_capable": True,
+            "validated": False,
+        }
+        assert stored["response"] == data == fetched
+        public_record = json.dumps(data)
+        assert "not json" not in public_record
+        for forbidden in ("codex_reasoning_items", "encrypted_content", "api_key", "base_url"):
+            assert forbidden not in public_record
 
     @pytest.mark.asyncio
     async def test_invalid_structured_output_is_repaired_before_returning_to_client(self, adapter):
@@ -2977,6 +3074,8 @@ class TestResponsesStreaming:
         assert "not json" not in body
         assert "event: hermes.sidecar" not in body
         assert "structured_output_validation_failed" in body
+        assert '"completed": false' in body
+        assert '"failed": true' in body
         assert agent._persist_disabled is True
         agent._flush_messages_to_session_db.assert_not_called()
         agent._sync_external_memory_for_turn.assert_not_called()
