@@ -1957,7 +1957,7 @@ class APIServerAdapter(BasePlatformAdapter):
 
     def _strict_structured_output_supported(self, route: Optional[Dict[str, Any]]) -> bool:
         """Return whether the configured route advertises strict JSON support."""
-        from agent.models_dev import get_model_info
+        from agent import models_dev
         from gateway.run import _load_gateway_config, _resolve_gateway_model
 
         config = _load_gateway_config()
@@ -1965,8 +1965,20 @@ class APIServerAdapter(BasePlatformAdapter):
         configured_provider = model_config.get("provider") if isinstance(model_config, dict) else None
         provider = (route or {}).get("provider") or configured_provider
         model = (route or {}).get("model") or _resolve_gateway_model(config)
-        info = get_model_info(str(provider or ""), str(model or ""))
-        return bool(info and info.structured_output)
+        provider_id = models_dev.PROVIDER_TO_MODELS_DEV.get(
+            str(provider or ""), str(provider or "")
+        )
+        registry = models_dev._models_dev_cache or models_dev._load_disk_cache()
+        provider_data = registry.get(provider_id) if isinstance(registry, dict) else None
+        model_entries = provider_data.get("models", {}) if isinstance(provider_data, dict) else {}
+        raw = model_entries.get(str(model or "")) if isinstance(model_entries, dict) else None
+        if not isinstance(raw, dict) and isinstance(model_entries, dict):
+            model_id = str(model or "").lower()
+            raw = next((
+                entry for key, entry in model_entries.items()
+                if str(key).lower() == model_id and isinstance(entry, dict)
+            ), None)
+        return bool(isinstance(raw, dict) and raw.get("structured_output"))
 
     def _session_model_override_for(self, session_key: Optional[str]) -> Optional[Dict[str, Any]]:
         """Return the gateway's session ``/model`` override for *session_key*, if any.
@@ -4414,10 +4426,40 @@ class APIServerAdapter(BasePlatformAdapter):
                 **sidecar_context,
             )
             if store:
-                failed_history = self._validated_structured_result(
-                    failure_result, safe_message
-                ).get("messages")
-                if not isinstance(failed_history, list) or not failed_history:
+                result_messages = failure_result.get("messages")
+                if isinstance(result_messages, list) and result_messages:
+                    failed_history = [
+                        dict(item) if isinstance(item, dict) else item
+                        for item in result_messages
+                    ]
+                    turn_start = self._response_messages_turn_start_index(
+                        conversation_history, user_message, failure_result
+                    )
+                    for index in range(len(failed_history) - 1, -1, -1):
+                        item = failed_history[index]
+                        if (
+                            isinstance(item, dict)
+                            and item.get("role") == "user"
+                            and item.get("content") == user_message
+                        ):
+                            turn_start = max(turn_start, index + 1)
+                            break
+                    replaced = False
+                    for index in range(len(failed_history) - 1, turn_start - 1, -1):
+                        item = failed_history[index]
+                        if (
+                            isinstance(item, dict)
+                            and item.get("role") == "assistant"
+                            and item.get("content")
+                        ):
+                            item["content"] = safe_message
+                            item.pop("api_content", None)
+                            item.pop("codex_message_items", None)
+                            replaced = True
+                            break
+                    if not replaced:
+                        failed_history.append({"role": "assistant", "content": safe_message})
+                else:
                     failed_history = list(conversation_history)
                     failed_history.extend((
                         {"role": "user", "content": user_message},

@@ -2752,19 +2752,24 @@ class TestStructuredOutput:
             "validated": True,
         }
 
-    def test_route_capability_reads_config_without_runtime_resolution(self, adapter):
+    def test_route_capability_uses_local_snapshot_without_refresh(self, adapter):
         with (
             patch("gateway.run._load_gateway_config", return_value={
                 "model": {"provider": "openai", "default": "gpt-test"},
             }),
             patch("gateway.run._resolve_runtime_agent_kwargs") as runtime_resolver,
-            patch("agent.models_dev.get_model_info", return_value=MagicMock(
-                structured_output=True,
-            )),
+            patch("agent.models_dev._models_dev_cache", {}),
+            patch("agent.models_dev._load_disk_cache", return_value={
+                "openai": {"models": {"gpt-test": {"structured_output": True}}},
+            }),
+            patch("agent.models_dev.requests.get") as network_get,
+            patch("agent.models_dev._save_disk_cache") as save_cache,
         ):
             assert adapter._strict_structured_output_supported(None) is True
 
         runtime_resolver.assert_not_called()
+        network_get.assert_not_called()
+        save_cache.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_failed_strict_response_persists_terminal_sidecar(self, adapter):
@@ -2865,6 +2870,46 @@ class TestStructuredOutput:
         assert "not json" not in persisted
         assert "api_content" not in persisted
         assert "codex_message_items" not in persisted
+
+    @pytest.mark.asyncio
+    async def test_failed_structured_response_appends_error_after_current_user(self, adapter):
+        prior = [
+            {"role": "user", "content": "old question"},
+            {"role": "assistant", "content": "old answer"},
+        ]
+        adapter._response_store.put("resp_prior", {
+            "response": {"id": "resp_prior", "status": "completed"},
+            "conversation_history": prior,
+            "session_id": "existing-session",
+        })
+        result = {
+            "final_response": "",
+            "messages": prior + [{"role": "user", "content": "new question"}],
+            "failed": True,
+            "completed": False,
+            "error": "provider failed",
+        }
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
+                mock_run.return_value = (
+                    result,
+                    {"input_tokens": 1, "output_tokens": 0, "total_tokens": 1},
+                )
+                resp = await cli.post("/v1/responses", json={
+                    "model": "hermes-agent",
+                    "input": "new question",
+                    "previous_response_id": "resp_prior",
+                    "text": {"format": {"type": "json_object"}},
+                })
+                data = await resp.json()
+
+        stored_history = adapter._response_store.get(data["id"])["conversation_history"]
+        assert resp.status == 502
+        assert stored_history[:3] == prior + [{"role": "user", "content": "new question"}]
+        assert stored_history[-1] == {
+            "role": "assistant", "content": data["error"]["message"],
+        }
 
     @pytest.mark.asyncio
     async def test_invalid_structured_output_is_repaired_before_returning_to_client(self, adapter):
