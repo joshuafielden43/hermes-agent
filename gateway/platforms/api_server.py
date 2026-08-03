@@ -6273,8 +6273,15 @@ class APIServerAdapter(BasePlatformAdapter):
                         result.get("_structured_output_capable")
                     )
                 agent_final = result.get("final_response", "") if isinstance(result, dict) else ""
+                provider_auth_error = (
+                    _redact_api_error_text(result.get("_provider_auth_error"))
+                    if isinstance(result, dict) and result.get("_provider_auth_error")
+                    else None
+                )
                 structured_run_error = _structured_run_error(result)
-                if output_contract and structured_run_error:
+                if output_contract and provider_auth_error:
+                    agent_error = provider_auth_error
+                elif output_contract and structured_run_error:
                     agent_error = structured_run_error
                 elif output_contract:
                     try:
@@ -8018,6 +8025,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     return (
                         {
                             "final_response": f"⚠️ Provider authentication failed: {exc}",
+                            "_provider_auth_error": _redact_api_error_text(exc),
                             "messages": [],
                             "api_calls": 0,
                             "tools": [],
