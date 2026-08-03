@@ -158,6 +158,30 @@ async def test_nonstream_repairs_once_and_commits_canonical(surface, path):
     ("chat", "/v1/chat/completions"),
     ("responses", "/v1/responses"),
 ))
+async def test_nonstream_provider_auth_failure_never_repairs(surface, path):
+    adapter = _adapter()
+    raw_error = "provider credential unavailable: api_key=raw-test-secret"
+
+    with patch.object(
+        adapter,
+        "_create_agent",
+        side_effect=_ProviderAuthResolutionError(raw_error),
+    ) as create_agent:
+        async with TestClient(TestServer(_app(adapter))) as client:
+            response = await client.post(path, json=_payload(surface))
+            body = await response.json()
+
+    assert response.status == 502
+    assert body["error"]["code"] == "agent_error"
+    assert raw_error not in json.dumps(body)
+    assert create_agent.call_count == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("surface", "path"), (
+    ("chat", "/v1/chat/completions"),
+    ("responses", "/v1/responses"),
+))
 async def test_terminal_invalid_output_neither_leaks_nor_persists(surface, path):
     adapter = _adapter()
     agent = MagicMock()
@@ -405,3 +429,33 @@ def test_unsupported_effective_mode_fails_closed(monkeypatch):
 
     with pytest.raises(StructuredOutputRequestError, match="not supported"):
         adapter._create_agent(output_contract=contract)
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("surface", "path"), (
+    ("chat", "/v1/chat/completions"),
+    ("responses", "/v1/responses"),
+))
+async def test_nonstream_provider_auth_from_isolated_home_never_repairs(
+    surface, path, tmp_path, monkeypatch, caplog
+):
+    hermes_home = tmp_path / "hermes"
+    hermes_home.mkdir()
+    (hermes_home / "config.yaml").write_text(
+        "model:\n  provider: openrouter\n  default: test-model\n", encoding="utf-8"
+    )
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    monkeypatch.delenv("HERMES_PROFILE", raising=False)
+    adapter = _adapter()
+
+    async with TestClient(TestServer(_app(adapter))) as client:
+        response = await client.post(path, json=_payload(surface))
+        body = await response.json()
+
+    assert response.status == 502
+    assert body["error"]["code"] == "agent_error"
+    assert "structured_output_validation_failed" not in json.dumps(body)
+    assert sum(
+        "Provider authentication failed for session=" in record.getMessage()
+        for record in caplog.records
+    ) == 1
