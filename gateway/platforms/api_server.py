@@ -5798,8 +5798,17 @@ class APIServerAdapter(BasePlatformAdapter):
                 err_msg = err_msg or str(agent_error)
 
             structured_output_failed = False
+            provider_auth_error = (
+                _redact_api_error_text(result.get("_provider_auth_error"))
+                if isinstance(result, dict) and result.get("_provider_auth_error")
+                else None
+            )
             structured_run_error = _structured_run_error(result)
-            if output_contract and structured_run_error:
+            if output_contract and provider_auth_error:
+                is_failed = True
+                completed = False
+                err_msg = provider_auth_error
+            elif output_contract and structured_run_error:
                 is_failed = True
                 completed = False
                 err_msg = structured_run_error
