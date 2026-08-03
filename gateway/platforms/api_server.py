@@ -7850,6 +7850,15 @@ class APIServerAdapter(BasePlatformAdapter):
                 output_contract=output_contract,
                 format_only=True,
             )
+            repair_provider_auth_error = (
+                repair_result.get("_provider_auth_error")
+                if isinstance(repair_result, dict)
+                else None
+            )
+            if repair_provider_auth_error:
+                raise _ProviderAuthResolutionError(
+                    _redact_api_error_text(repair_provider_auth_error)
+                )
             repair_error = _structured_run_error(repair_result)
             if repair_error:
                 raise StructuredOutputRunError(repair_error)
