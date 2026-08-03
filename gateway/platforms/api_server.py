@@ -242,6 +242,10 @@ class StructuredOutputValidationError(ValueError):
         self.result = result
 
 
+class StructuredOutputRunError(RuntimeError):
+    """The agent run failed before producing output that can be validated."""
+
+
 class StructuredOutputRequestError(ValueError):
     """The effective provider runtime cannot honor the caller's contract."""
 
@@ -2895,8 +2899,8 @@ class APIServerAdapter(BasePlatformAdapter):
         """Return the gateway's session ``/model`` override for *session_key*, if any.
 
         The gateway tracks per-session ``/model`` switches in
-        ``GatewayRunner._session_model_overrides``. It applies only when the
-        HTTP request omits ``model``; an explicit configured HTTP model wins.
+        ``GatewayRunner._session_model_overrides``. The session override takes
+        precedence over an explicit configured HTTP model.
         """
         if not session_key:
             return None
@@ -5511,7 +5515,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 return web.json_response(
                     _openai_error(str(exc), code="structured_output_unsupported"), status=400
                 )
-            except _ProviderAuthResolutionError as exc:
+            except (_ProviderAuthResolutionError, StructuredOutputRunError) as exc:
                 error = _openai_error(str(exc), err_type="server_error", code="agent_error")
                 error["hermes"] = _hermes_sidecar(session_id=session_id, contract=output_contract, validated=False, **sidecar_context)
                 return web.json_response(error, status=502)
@@ -5532,7 +5536,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 return web.json_response(
                     _openai_error(str(exc), code="structured_output_unsupported"), status=400
                 )
-            except _ProviderAuthResolutionError as exc:
+            except (_ProviderAuthResolutionError, StructuredOutputRunError) as exc:
                 error = _openai_error(str(exc), err_type="server_error", code="agent_error")
                 error["hermes"] = _hermes_sidecar(session_id=session_id, contract=output_contract, validated=False, **sidecar_context)
                 return web.json_response(error, status=502)
@@ -6868,7 +6872,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 return web.json_response(
                     _openai_error(str(exc), code="structured_output_unsupported"), status=400
                 )
-            except _ProviderAuthResolutionError as exc:
+            except (_ProviderAuthResolutionError, StructuredOutputRunError) as exc:
                 return _failed_response(exc, status=502, code="agent_error", validated=False)
             except StructuredOutputValidationError as exc:
                 return _failed_response(
@@ -6889,7 +6893,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 return web.json_response(
                     _openai_error(str(exc), code="structured_output_unsupported"), status=400
                 )
-            except _ProviderAuthResolutionError as exc:
+            except (_ProviderAuthResolutionError, StructuredOutputRunError) as exc:
                 return _failed_response(exc, status=502, code="agent_error", validated=False)
             except StructuredOutputValidationError as exc:
                 return _failed_response(
@@ -7760,7 +7764,7 @@ class APIServerAdapter(BasePlatformAdapter):
             )
         run_error = _structured_run_error(result)
         if run_error:
-            raise StructuredOutputValidationError(run_error, result=initial_result)
+            raise StructuredOutputRunError(run_error)
         raw_response = _resolve_media_to_data_urls(result.get("final_response") or "")
         try:
             normalized = _validated_structured_output(output_contract, raw_response)
@@ -7793,7 +7797,7 @@ class APIServerAdapter(BasePlatformAdapter):
             )
             repair_error = _structured_run_error(repair_result)
             if repair_error:
-                raise StructuredOutputValidationError(repair_error, result=initial_result)
+                raise StructuredOutputRunError(repair_error)
             raw_response = _resolve_media_to_data_urls(repair_result.get("final_response") or "")
             try:
                 normalized = _validated_structured_output(output_contract, raw_response)
