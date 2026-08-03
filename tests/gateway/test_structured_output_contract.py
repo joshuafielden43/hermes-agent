@@ -12,6 +12,7 @@ from gateway.platforms.api_server import (
     APIServerAdapter,
     _ProviderAuthResolutionError,
     StructuredOutputRequestError,
+    StructuredOutputRunError,
     StructuredOutputValidationError,
     _structured_output_contract,
     _validated_structured_output,
@@ -175,6 +176,54 @@ async def test_nonstream_provider_auth_failure_never_repairs(surface, path):
     assert body["error"]["code"] == "agent_error"
     assert raw_error not in json.dumps(body)
     assert create_agent.call_count == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("surface", "path"), (
+    ("chat", "/v1/chat/completions"),
+    ("responses", "/v1/responses"),
+))
+@pytest.mark.parametrize("failed_result", (
+    {"completed": False},
+    {"failed": True, "error": "private provider failure"},
+))
+async def test_nonstream_run_failure_is_agent_error(surface, path, failed_result):
+    adapter = _adapter()
+
+    async with TestClient(TestServer(_app(adapter))) as client:
+        with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as run:
+            run.return_value = (_result("private assistant body", **failed_result), _usage())
+            response = await client.post(path, json=_payload(surface))
+            body = await response.json()
+
+    assert response.status == 502
+    assert body["error"]["code"] == "agent_error"
+    assert "private assistant body" not in json.dumps(body)
+    assert run.call_count == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("surface", "path"), (
+    ("chat", "/v1/chat/completions"),
+    ("responses", "/v1/responses"),
+))
+async def test_nonstream_repair_run_failure_is_agent_error(surface, path):
+    adapter = _adapter()
+
+    async def run(**kwargs):
+        if kwargs.get("format_only"):
+            return _result("private repair body", completed=False), _usage()
+        return _result("not json"), _usage()
+
+    async with TestClient(TestServer(_app(adapter))) as client:
+        with patch.object(adapter, "_run_agent", side_effect=run) as run_mock:
+            response = await client.post(path, json=_payload(surface))
+            body = await response.json()
+
+    assert response.status == 502
+    assert body["error"]["code"] == "agent_error"
+    assert "private repair body" not in json.dumps(body)
+    assert run_mock.call_count == 2
 
 
 @pytest.mark.asyncio
