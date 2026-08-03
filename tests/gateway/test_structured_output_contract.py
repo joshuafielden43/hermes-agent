@@ -339,7 +339,11 @@ async def test_responses_stream_provider_failure_is_not_schema_failure():
 
 
 @pytest.mark.asyncio
-async def test_responses_stream_provider_auth_failure_is_agent_error():
+@pytest.mark.parametrize(("surface", "path"), (
+    ("chat", "/v1/chat/completions"),
+    ("responses", "/v1/responses"),
+))
+async def test_stream_provider_auth_failure_is_agent_error(surface, path):
     adapter = _adapter()
 
     with patch.object(
@@ -349,14 +353,16 @@ async def test_responses_stream_provider_auth_failure_is_agent_error():
     ):
         async with TestClient(TestServer(_app(adapter))) as client:
             response = await client.post(
-                "/v1/responses", json=_payload("responses", stream=True)
+                path, json=_payload(surface, stream=True)
             )
             body = await response.text()
 
-    assert "event: response.failed" in body
-    assert '"code": "agent_error"' in body
+    assert ('"error_code": "agent_error"' if surface == "chat" else '"code": "agent_error"') in body
     assert "structured_output_validation_failed" not in body
-    assert "event: response.output_text.delta" not in body
+    assert "provider credential unavailable" not in body
+    if surface == "responses":
+        assert "event: response.failed" in body
+        assert "event: response.output_text.delta" not in body
 
 
 @pytest.mark.asyncio
