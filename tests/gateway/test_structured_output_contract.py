@@ -207,12 +207,16 @@ async def test_nonstream_run_failure_is_agent_error(surface, path, failed_result
     ("chat", "/v1/chat/completions"),
     ("responses", "/v1/responses"),
 ))
-async def test_nonstream_repair_run_failure_is_agent_error(surface, path):
+@pytest.mark.parametrize("repair_failure", (
+    {"completed": False},
+    {"_provider_auth_error": "Provider authentication failed"},
+))
+async def test_nonstream_repair_failure_is_agent_error(surface, path, repair_failure):
     adapter = _adapter()
 
     async def run(**kwargs):
         if kwargs.get("format_only"):
-            return _result("private repair body", completed=False), _usage()
+            return _result("private repair body", **repair_failure), _usage()
         return _result("not json"), _usage()
 
     async with TestClient(TestServer(_app(adapter))) as client:
