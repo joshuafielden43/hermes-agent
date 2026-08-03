@@ -2051,7 +2051,12 @@ def _build_api_kwargs_for_mode(agent, api_messages: list, tools_for_api: list | 
         # the profile hook that produces them is only consulted by the
         # OpenAI-wire transport. Merge them here so Messages traffic keeps
         # product attribution and sticky routing.
-        return _merge_nous_portal_messages_extra_body(agent, anthropic_kwargs)
+        anthropic_kwargs = _merge_nous_portal_messages_extra_body(agent, anthropic_kwargs)
+        from agent.structured_output import apply_anthropic_format
+        return apply_anthropic_format(
+            anthropic_kwargs,
+            getattr(agent, "_gateway_response_format", None),
+        )
 
     # AWS Bedrock native Converse API — bypasses the OpenAI client entirely.
     # The adapter handles message/tool conversion and boto3 calls directly.
