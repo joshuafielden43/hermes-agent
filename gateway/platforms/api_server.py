@@ -3290,7 +3290,14 @@ class APIServerAdapter(BasePlatformAdapter):
         if request_service_tier is not _REQUEST_OPTION_MISSING:
             agent_kwargs["service_tier"] = request_service_tier
 
-        agent = AIAgent(**agent_kwargs)
+        try:
+            agent = AIAgent(**agent_kwargs)
+        except RuntimeError as exc:
+            if not str(exc).startswith("No LLM provider configured."):
+                raise
+            raise _ProviderAuthResolutionError(
+                "Provider authentication failed"
+            ) from exc
         if output_contract:
             from agent.models_dev import get_model_info
             from agent.structured_output import unsupported_reason
@@ -5504,6 +5511,10 @@ class APIServerAdapter(BasePlatformAdapter):
                 return web.json_response(
                     _openai_error(str(exc), code="structured_output_unsupported"), status=400
                 )
+            except _ProviderAuthResolutionError as exc:
+                error = _openai_error(str(exc), err_type="server_error", code="agent_error")
+                error["hermes"] = _hermes_sidecar(session_id=session_id, contract=output_contract, validated=False, **sidecar_context)
+                return web.json_response(error, status=502)
             except StructuredOutputValidationError as exc:
                 error = _openai_error(str(exc), err_type="server_error", code="structured_output_validation_failed")
                 error["hermes"] = _hermes_sidecar(session_id=session_id, contract=output_contract, validated=False, **sidecar_context)
@@ -5521,6 +5532,10 @@ class APIServerAdapter(BasePlatformAdapter):
                 return web.json_response(
                     _openai_error(str(exc), code="structured_output_unsupported"), status=400
                 )
+            except _ProviderAuthResolutionError as exc:
+                error = _openai_error(str(exc), err_type="server_error", code="agent_error")
+                error["hermes"] = _hermes_sidecar(session_id=session_id, contract=output_contract, validated=False, **sidecar_context)
+                return web.json_response(error, status=502)
             except StructuredOutputValidationError as exc:
                 error = _openai_error(str(exc), err_type="server_error", code="structured_output_validation_failed")
                 error["hermes"] = _hermes_sidecar(session_id=session_id, contract=output_contract, validated=False, **sidecar_context)
@@ -6853,6 +6868,8 @@ class APIServerAdapter(BasePlatformAdapter):
                 return web.json_response(
                     _openai_error(str(exc), code="structured_output_unsupported"), status=400
                 )
+            except _ProviderAuthResolutionError as exc:
+                return _failed_response(exc, status=502, code="agent_error", validated=False)
             except StructuredOutputValidationError as exc:
                 return _failed_response(
                     exc, status=502, code="structured_output_validation_failed", validated=False
@@ -6872,6 +6889,8 @@ class APIServerAdapter(BasePlatformAdapter):
                 return web.json_response(
                     _openai_error(str(exc), code="structured_output_unsupported"), status=400
                 )
+            except _ProviderAuthResolutionError as exc:
+                return _failed_response(exc, status=502, code="agent_error", validated=False)
             except StructuredOutputValidationError as exc:
                 return _failed_response(
                     exc, status=502, code="structured_output_validation_failed", validated=False
@@ -7734,6 +7753,11 @@ class APIServerAdapter(BasePlatformAdapter):
             return result, usage
 
         initial_result = result
+        provider_auth_error = result.get("_provider_auth_error") if isinstance(result, dict) else None
+        if provider_auth_error:
+            raise _ProviderAuthResolutionError(
+                _redact_api_error_text(provider_auth_error)
+            )
         run_error = _structured_run_error(result)
         if run_error:
             raise StructuredOutputValidationError(run_error, result=initial_result)
@@ -8020,12 +8044,11 @@ class APIServerAdapter(BasePlatformAdapter):
                     # all (raw aiohttp 500, no JSON body).  Handling it
                     # here, once, covers every _run_agent() caller;
                     # /v1/runs has its own branch in its executor.
-                    logger.warning("Provider authentication failed for session=%s: %s",
-                                   session_id or "", exc)
+                    logger.warning("Provider authentication failed for session=%s", session_id or "")
                     return (
                         {
-                            "final_response": f"⚠️ Provider authentication failed: {exc}",
-                            "_provider_auth_error": _redact_api_error_text(exc),
+                            "final_response": "⚠️ Provider authentication failed",
+                            "_provider_auth_error": "Provider authentication failed",
                             "messages": [],
                             "api_calls": 0,
                             "tools": [],
