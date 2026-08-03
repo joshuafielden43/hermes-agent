@@ -2129,6 +2129,9 @@ class AIAgent:
         never mutating the live message list used by the API call (#48677 is
         thus closed for every persist caller, not just this one).
         """
+        if getattr(self, "_persist_disabled", False):
+            return
+
         # Scaffolding removal mutates the live list (desired — ephemeral
         # retry/failure sentinels must not survive into the real transcript).
         # Close and turn-start persistence can run on separate CLI threads; the
@@ -4829,7 +4832,7 @@ class AIAgent:
         providers are strictly best-effort — a misconfigured or offline
         backend must not block the user from seeing their response.
         """
-        if interrupted:
+        if getattr(self, "_persist_disabled", False) or interrupted:
             return
         if not (self._memory_manager and final_response and original_user_message):
             return

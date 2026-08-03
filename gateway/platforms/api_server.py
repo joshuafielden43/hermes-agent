@@ -61,6 +61,10 @@ import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+import jsonschema
+from referencing import Registry
+from referencing.exceptions import NoSuchResource, Unresolvable
+
 # Sentinel returned by _resolve_request_profile when a /p/<profile>/ prefix
 # names a profile this gateway does not serve (→ 404). Distinct from None
 # (no prefix / multiplexing off → handle as the default profile).
@@ -235,6 +239,138 @@ def _browser_controller_ws_sender(ws, loop, *, wait_timeout: float = 10.0):
             future.add_done_callback(observe_late_send)
 
     return send
+class StructuredOutputValidationError(ValueError):
+    """The provider returned text that does not meet the requested contract."""
+
+    def __init__(self, message: str, *, result: Optional[Dict[str, Any]] = None):
+        super().__init__(message)
+        self.result = result
+
+
+class StructuredOutputRequestError(ValueError):
+    """The effective provider runtime cannot honor the caller's contract."""
+
+
+def _deny_schema_retrieval(uri: str):
+    raise NoSuchResource(ref=uri)
+
+
+_NO_RETRIEVAL_SCHEMA_REGISTRY = Registry(retrieve=_deny_schema_retrieval)
+
+
+def _reject_external_schema_references(schema: Dict[str, Any]) -> None:
+    """Keep caller-supplied schemas self-contained."""
+    pending: List[Any] = [schema]
+    while pending:
+        node = pending.pop()
+        if isinstance(node, dict):
+            for key, value in node.items():
+                if (
+                    key in {"$ref", "$dynamicRef"}
+                    and isinstance(value, str)
+                    and value
+                    and not value.startswith("#")
+                ):
+                    raise ValueError("JSON Schema external references are not supported")
+                pending.append(value)
+        elif isinstance(node, list):
+            pending.extend(node)
+
+
+def _structured_output_contract(value: Any, *, responses: bool) -> Optional[Dict[str, Any]]:
+    """Normalize Chat ``response_format`` and Responses ``text.format``.
+
+    Shape normalization follows the provider-mapping work in PR #39595; this
+    version additionally compiles schemas for the boundary-enforcement collar.
+    """
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise ValueError("response format must be an object")
+    kind = value.get("type")
+    if kind == "text":
+        return None
+    if kind == "json_object":
+        return {"type": kind, "provider_format": {"type": kind}, "responses_format": {"type": kind}}
+    if kind != "json_schema":
+        raise ValueError("response format type must be text, json_object, or json_schema")
+
+    schema_spec = value if responses else value.get("json_schema")
+    if not isinstance(schema_spec, dict):
+        raise ValueError("json_schema requires a json_schema object")
+    name = schema_spec.get("name")
+    schema = schema_spec.get("schema")
+    strict = schema_spec.get("strict", False)
+    if not isinstance(name, str) or not name.strip() or not isinstance(schema, dict):
+        raise ValueError("json_schema requires string name and object schema")
+    if not isinstance(strict, bool):
+        raise ValueError("json_schema.strict must be a boolean")
+    _reject_external_schema_references(schema)
+    try:
+        jsonschema.Draft202012Validator.check_schema(schema)
+    except jsonschema.SchemaError as exc:
+        raise ValueError(f"invalid JSON Schema: {exc.message}") from exc
+    provider_schema = {"name": name, "schema": schema, "strict": strict}
+    if isinstance(schema_spec.get("description"), str):
+        provider_schema["description"] = schema_spec["description"]
+    return {
+        "type": kind,
+        "schema": schema,
+        "strict": strict,
+        "provider_format": {"type": kind, "json_schema": provider_schema},
+        "responses_format": {"type": kind, **provider_schema},
+    }
+
+
+def _validated_structured_output(contract: Optional[Dict[str, Any]], text: str) -> str:
+    """Parse fenced/provider text and return canonical validated JSON."""
+    if contract is None:
+        return text
+    payload = text.strip()
+    if payload.startswith("```"):
+        payload = payload.split("\n", 1)[1] if "\n" in payload else ""
+        if payload.endswith("```"):
+            payload = payload[:-3].rstrip()
+
+    def _reject_nonfinite(value: str):
+        raise ValueError(f"non-finite JSON value: {value}")
+
+    try:
+        parsed = json.loads(payload, parse_constant=_reject_nonfinite)
+    except (json.JSONDecodeError, ValueError) as exc:
+        raise StructuredOutputValidationError("model output was not valid JSON") from exc
+    if contract["type"] == "json_object" and not isinstance(parsed, dict):
+        raise StructuredOutputValidationError("model output was not a JSON object")
+    if contract["type"] == "json_schema":
+        try:
+            jsonschema.Draft202012Validator(
+                contract["schema"], registry=_NO_RETRIEVAL_SCHEMA_REGISTRY
+            ).validate(parsed)
+        except (jsonschema.ValidationError, Unresolvable) as exc:
+            raise StructuredOutputValidationError("model output did not match the requested JSON Schema") from exc
+    return json.dumps(parsed, ensure_ascii=False)
+
+
+_STRUCTURED_OUTPUT_REPAIR_INSTRUCTION = """Your immediately preceding final answer was rejected because it did not satisfy the response format for this API request. Return a corrected replacement now. Output exactly one JSON value that conforms to the existing requested response format. Do not include Markdown, prose, explanations, or tool calls."""
+
+
+def _hermes_sidecar(
+    *, session_id: Optional[str], continuation: str, route: str,
+    contract: Optional[Dict[str, Any]], compressed: bool = False, validated: bool = True,
+    structured_output_capable: bool = False,
+) -> Dict[str, Any]:
+    """Return additive API metadata without provider reasoning or credentials."""
+    return {
+        "context": {"session_id": session_id, "continuation": continuation, "compressed": compressed},
+        "output_contract": {
+            "mode": (contract or {}).get("type", "text"),
+            "strict": bool((contract or {}).get("strict", False)),
+            "route_capable": bool(structured_output_capable),
+            "validated": validated,
+        },
+        "route": route,
+        "reasoning": {"mode": "provider_managed", "exposed": False},
+    }
 
 
 def _hermes_version() -> str:
@@ -1219,6 +1355,16 @@ def _redact_api_error_text(value: Any, *, limit: int | None = None) -> str:
     if limit is not None:
         return redacted[:limit]
     return redacted
+
+
+def _structured_run_error(result: Any) -> Optional[str]:
+    """Return a safe error unless a structured-output run fully completed."""
+    if not isinstance(result, dict):
+        return "Agent run did not complete"
+    error = result.get("error")
+    if result.get("partial") or result.get("failed") or not result.get("completed", True) or error:
+        return _redact_api_error_text(error or "Agent run did not complete")
+    return None
 
 
 def _openai_error(message: str, err_type: str = "invalid_request_error", param: str = None, code: str = None) -> Dict[str, Any]:
@@ -2741,10 +2887,8 @@ class APIServerAdapter(BasePlatformAdapter):
         """Return the gateway's session ``/model`` override for *session_key*, if any.
 
         The gateway tracks per-session ``/model`` switches in
-        ``GatewayRunner._session_model_overrides``.  API-server requests that
-        share such a session key must keep honouring the explicit session
-        override even when the request's ``model`` field matches a configured
-        route — a user-issued ``/model`` always wins over static config.
+        ``GatewayRunner._session_model_overrides``. It applies only when the
+        HTTP request omits ``model``; an explicit configured HTTP model wins.
         """
         if not session_key:
             return None
@@ -2820,6 +2964,9 @@ class APIServerAdapter(BasePlatformAdapter):
         confirmed_runtime_lock: bool = False,
         room_dispatch: Optional[Dict[str, Any]] = None,
         room_execution_policy: Optional[Dict[str, Any]] = None,
+        output_contract: Optional[Dict[str, Any]] = None,
+        format_only: bool = False,
+        defer_persistence: bool = False,
     ) -> Any:
         """
         Create an AIAgent instance using the gateway's runtime config.
@@ -3093,12 +3240,14 @@ class APIServerAdapter(BasePlatformAdapter):
             policy = RoomExecutionPolicy.from_mapping(room_execution_policy or {})
             enabled_toolsets = list(policy.enabled_toolsets)
             max_iterations = policy.max_iterations
+        if format_only:
+            enabled_toolsets = []
 
         # Load fallback provider chain so the API server platform has the
         # same fallback behaviour as Telegram/Discord/Slack (fixes #4954).
         fallback_model = (
             None
-            if confirmed_runtime_lock
+            if confirmed_runtime_lock or format_only or output_contract
             else GatewayRunner._load_fallback_model()
         )
 
@@ -3131,15 +3280,44 @@ class APIServerAdapter(BasePlatformAdapter):
             "tool_progress_callback": tool_progress_callback,
             "tool_start_callback": tool_start_callback,
             "tool_complete_callback": tool_complete_callback,
-            "session_db": self._ensure_session_db(),
+            "session_db": None if format_only else self._ensure_session_db(),
             "fallback_model": fallback_model,
             "reasoning_config": reasoning_config,
             "gateway_session_key": gateway_session_key,
+            "skip_memory": format_only,
         }
         if request_service_tier is not _REQUEST_OPTION_MISSING:
             agent_kwargs["service_tier"] = request_service_tier
 
         agent = AIAgent(**agent_kwargs)
+        if output_contract:
+            from agent.models_dev import get_model_info
+            from agent.structured_output import unsupported_reason
+
+            api_mode = getattr(agent, "api_mode", None)
+            reason = unsupported_reason(output_contract["provider_format"], api_mode)
+            if reason:
+                raise StructuredOutputRequestError(reason)
+            info = get_model_info(
+                str(getattr(agent, "provider", "") or ""),
+                str(getattr(agent, "model", "") or ""),
+                allow_network=False,
+            )
+            capable = bool(info and info.structured_output)
+            if output_contract["type"] == "json_schema" and output_contract.get("strict") and not capable:
+                raise StructuredOutputRequestError(
+                    "The effective model does not advertise strict structured-output support."
+                )
+            agent._structured_output_capable = capable
+            agent._gateway_response_format = output_contract["provider_format"]
+            overrides = dict(getattr(agent, "request_overrides", {}) or {})
+            if api_mode == "codex_responses":
+                overrides["text"] = {"format": output_contract["responses_format"]}
+            elif api_mode == "chat_completions":
+                overrides["response_format"] = output_contract["provider_format"]
+            agent.request_overrides = overrides
+        if format_only or defer_persistence:
+            agent._persist_disabled = True
         agent._hermes_api_runtime = {
             "provider": runtime_kwargs.get("provider") or getattr(agent, "provider", "") or "",
             "model": getattr(agent, "model", None) or model,
@@ -5189,6 +5367,19 @@ class APIServerAdapter(BasePlatformAdapter):
         )
         if selection_error:
             return web.json_response(_openai_error(selection_error), status=400)
+        try:
+            output_contract = _structured_output_contract(
+                body.get("response_format"), responses=False
+            )
+        except ValueError as exc:
+            return web.json_response(
+                _openai_error(str(exc), code="invalid_response_format"), status=400
+            )
+        sidecar_context = {
+            "continuation": "session" if provided_session_id else ("caller_history" if history else "new"),
+            "route": model_name if route else "default",
+            "structured_output_capable": False,
+        }
 
         if stream:
             _stream_q = ThreadSafeAsyncQueue()
@@ -5275,6 +5466,8 @@ class APIServerAdapter(BasePlatformAdapter):
                 gateway_session_key=gateway_session_key,
                 **agent_overrides,
                 route=route,
+                output_contract=output_contract,
+                defer_persistence=bool(output_contract),
             ))
             # Ensure SSE drain loops can terminate without relying on polling
             # agent_task.done(), which can race with queue timeout checks.
@@ -5284,11 +5477,14 @@ class APIServerAdapter(BasePlatformAdapter):
                 request, completion_id, model_name, created, _stream_q,
                 agent_task, agent_ref, session_id=session_id,
                 gateway_session_key=gateway_session_key,
+                output_contract=output_contract,
+                conversation_history=history,
+                user_message=user_message,
             )
 
         # Non-streaming: run the agent (with optional Idempotency-Key)
         async def _compute_completion():
-            return await self._run_agent(
+            return await self._run_agent_with_structured_output_repair(
                 user_message=user_message,
                 conversation_history=history,
                 ephemeral_system_prompt=system_prompt,
@@ -5296,6 +5492,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 gateway_session_key=gateway_session_key,
                 **agent_overrides,
                 route=route,
+                output_contract=output_contract,
             )
 
         idempotency_key = request.headers.get("Idempotency-Key")
@@ -5310,12 +5507,21 @@ class APIServerAdapter(BasePlatformAdapter):
                     "tools",
                     "tool_choice",
                     "stream",
+                    "response_format",
                 ],
             )
             try:
                 result, usage = await _idem_cache.get_or_set(
                     idempotency_key, fp, _compute_completion
                 )
+            except StructuredOutputRequestError as exc:
+                return web.json_response(
+                    _openai_error(str(exc), code="structured_output_unsupported"), status=400
+                )
+            except StructuredOutputValidationError as exc:
+                error = _openai_error(str(exc), err_type="server_error", code="structured_output_validation_failed")
+                error["hermes"] = _hermes_sidecar(session_id=session_id, contract=output_contract, validated=False, **sidecar_context)
+                return web.json_response(error, status=502)
             except Exception as e:
                 logger.error(
                     "Error running agent for chat completions: %s", e, exc_info=True
@@ -5329,6 +5535,14 @@ class APIServerAdapter(BasePlatformAdapter):
         else:
             try:
                 result, usage = await _compute_completion()
+            except StructuredOutputRequestError as exc:
+                return web.json_response(
+                    _openai_error(str(exc), code="structured_output_unsupported"), status=400
+                )
+            except StructuredOutputValidationError as exc:
+                error = _openai_error(str(exc), err_type="server_error", code="structured_output_validation_failed")
+                error["hermes"] = _hermes_sidecar(session_id=session_id, contract=output_contract, validated=False, **sidecar_context)
+                return web.json_response(error, status=502)
             except Exception as e:
                 logger.error(
                     "Error running agent for chat completions: %s", e, exc_info=True
@@ -5340,7 +5554,17 @@ class APIServerAdapter(BasePlatformAdapter):
                     status=500,
                 )
 
+        sidecar_context["structured_output_capable"] = bool(
+            result.get("_structured_output_capable")
+        )
+
         final_response = _resolve_media_to_data_urls(result.get("final_response") or "")
+        try:
+            final_response = _validated_structured_output(output_contract, final_response)
+        except StructuredOutputValidationError as exc:
+            error = _openai_error(str(exc), err_type="server_error", code="structured_output_validation_failed")
+            error["hermes"] = _hermes_sidecar(session_id=session_id, contract=output_contract, validated=False, **sidecar_context)
+            return web.json_response(error, status=502)
         is_partial = bool(result.get("partial"))
         is_failed = bool(result.get("failed"))
         completed = bool(result.get("completed", True))
@@ -5405,14 +5629,18 @@ class APIServerAdapter(BasePlatformAdapter):
                 "total_tokens": usage.get("total_tokens", 0),
             },
         }
+        response_data["hermes"] = _hermes_sidecar(
+            session_id=result.get("session_id", session_id), contract=output_contract,
+            compressed=bool(result.get("_compressed")), **sidecar_context,
+        )
         if is_partial or is_failed or not completed:
-            response_data["hermes"] = {
+            response_data["hermes"].update({
                 "completed": completed,
                 "partial": is_partial,
                 "failed": is_failed,
                 "error": err_msg,
                 "error_code": "output_truncated" if finish_reason == "length" else "agent_error",
-            }
+            })
             response_headers["X-Hermes-Completed"] = "false"
             response_headers["X-Hermes-Partial"] = "true" if is_partial else "false"
             if err_msg:
@@ -5423,7 +5651,9 @@ class APIServerAdapter(BasePlatformAdapter):
     async def _write_sse_chat_completion(
         self, request: "web.Request", completion_id: str, model: str,
         created: int, stream_q, agent_task, agent_ref=None, session_id: str = None,
-        gateway_session_key: str = None,
+        gateway_session_key: str = None, output_contract: Optional[Dict[str, Any]] = None,
+        conversation_history: Optional[List[Dict[str, Any]]] = None,
+        user_message: Any = None,
     ) -> "web.StreamResponse":
         """Write real streaming SSE from agent's stream_delta_callback queue.
 
@@ -5451,6 +5681,7 @@ class APIServerAdapter(BasePlatformAdapter):
 
         try:
             last_activity = time.monotonic()
+            held_output: List[str] = []
 
             # Role chunk
             role_chunk = {
@@ -5462,6 +5693,15 @@ class APIServerAdapter(BasePlatformAdapter):
             last_activity = time.monotonic()
 
             # Helper — route a queue item to the correct SSE event.
+            async def _emit_content(content: str):
+                content_chunk = {
+                    "id": completion_id, "object": "chat.completion.chunk",
+                    "created": created, "model": model,
+                    "choices": [{"index": 0, "delta": {"content": content}, "finish_reason": None}],
+                }
+                await response.write(f"data: {json.dumps(content_chunk)}\n\n".encode())
+                return time.monotonic()
+
             async def _emit(item):
                 """Write a single queue item to the SSE stream.
 
@@ -5474,13 +5714,10 @@ class APIServerAdapter(BasePlatformAdapter):
                 """
                 if isinstance(item, tuple) and len(item) == 2 and item[0] == "__tool_progress__":
                     await response.write(_sse_frame(item[1], event="hermes.tool.progress"))
+                elif output_contract:
+                    held_output.append(item)
                 else:
-                    content_chunk = {
-                        "id": completion_id, "object": "chat.completion.chunk",
-                        "created": created, "model": model,
-                        "choices": [{"index": 0, "delta": {"content": item}, "finish_reason": None}],
-                    }
-                    await response.write(_sse_frame(content_chunk))
+                    return await _emit_content(item)
                 return time.monotonic()
 
             # Stream content chunks as they arrive from the agent. Woken
@@ -5541,6 +5778,32 @@ class APIServerAdapter(BasePlatformAdapter):
                 is_failed = True
                 err_msg = err_msg or str(agent_error)
 
+            structured_output_failed = False
+            structured_run_error = _structured_run_error(result)
+            if output_contract and structured_run_error:
+                is_failed = True
+                completed = False
+                err_msg = structured_run_error
+            elif output_contract:
+                raw_output = result.get("final_response", "") if isinstance(result, dict) else ""
+                try:
+                    normalized = _validated_structured_output(
+                        output_contract, raw_output or "".join(held_output)
+                    )
+                    result = self._validated_structured_result(result, normalized)
+                    await self._commit_validated_structured_turn(
+                        agent_ref[0] if agent_ref else None,
+                        result,
+                        conversation_history or [],
+                        user_message,
+                    )
+                    await _emit_content(normalized)
+                except StructuredOutputValidationError as exc:
+                    structured_output_failed = True
+                    is_failed = True
+                    completed = False
+                    err_msg = str(exc)
+
             # Decide finish_reason, matching the non-streaming logic: "length"
             # for truncation, "error" for failure, "stop" for normal completion.
             if is_partial and err_msg and "truncat" in err_msg.lower():
@@ -5573,7 +5836,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     "partial": is_partial,
                     "failed": is_failed,
                     "error": err_msg,
-                    "error_code": "output_truncated" if finish_reason == "length" else "agent_error",
+                    "error_code": "structured_output_validation_failed" if structured_output_failed else ("output_truncated" if finish_reason == "length" else "agent_error"),
                 }
             await response.write(_sse_frame(finish_chunk))
             await response.write(b"data: [DONE]\n\n")
@@ -5630,6 +5893,8 @@ class APIServerAdapter(BasePlatformAdapter):
         store: bool,
         session_id: str,
         gateway_session_key: Optional[str] = None,
+        output_contract: Optional[Dict[str, Any]] = None,
+        sidecar_context: Optional[Dict[str, str]] = None,
     ) -> "web.StreamResponse":
         """Write an SSE stream for POST /v1/responses (OpenAI Responses API).
 
@@ -5719,6 +5984,8 @@ class APIServerAdapter(BasePlatformAdapter):
         agent_error: Optional[str] = None
         usage: Dict[str, int] = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
         terminal_snapshot_persisted = False
+        held_output: List[str] = []
+        release_structured_output = False
 
         def _persist_response_snapshot(
             response_env: Dict[str, Any],
@@ -5808,6 +6075,9 @@ class APIServerAdapter(BasePlatformAdapter):
                 })
 
             async def _emit_text_delta(delta_text: str) -> None:
+                if output_contract and not release_structured_output:
+                    held_output.append(delta_text)
+                    return
                 await _open_message_item()
                 final_text_parts.append(delta_text)
                 await _write_event("response.output_text.delta", {
@@ -6016,18 +6286,46 @@ class APIServerAdapter(BasePlatformAdapter):
                 await _flush_batch()
 
             # Pick up agent result + usage from the completed task
+            structured_output_failed = False
             try:
                 result, agent_usage = await agent_task
                 usage = agent_usage or usage
-                # If the agent produced a final_response but no text
-                # deltas were streamed (e.g. some providers only emit
-                # the full response at the end), emit a single fallback
-                # delta so Responses clients still receive a live text part.
+                if sidecar_context is not None and isinstance(result, dict):
+                    sidecar_context["structured_output_capable"] = bool(
+                        result.get("_structured_output_capable")
+                    )
                 agent_final = result.get("final_response", "") if isinstance(result, dict) else ""
-                if agent_final and not final_text_parts:
-                    await _emit_text_delta(agent_final)
-                if agent_final and not final_response_text:
-                    final_response_text = agent_final
+                structured_run_error = _structured_run_error(result)
+                if output_contract and structured_run_error:
+                    agent_error = structured_run_error
+                elif output_contract:
+                    try:
+                        final_response_text = _validated_structured_output(
+                            output_contract, agent_final or "".join(held_output)
+                        )
+                        result = self._validated_structured_result(
+                            result, final_response_text
+                        )
+                        await self._commit_validated_structured_turn(
+                            agent_ref[0] if agent_ref else None,
+                            result,
+                            conversation_history,
+                            user_message,
+                        )
+                        release_structured_output = True
+                        await _emit_text_delta(final_response_text)
+                    except StructuredOutputValidationError as exc:
+                        structured_output_failed = True
+                        agent_error = str(exc)
+                else:
+                    # If the agent produced a final_response but no text
+                    # deltas were streamed (e.g. some providers only emit
+                    # the full response at the end), emit a single fallback
+                    # delta so Responses clients still receive a live text part.
+                    if agent_final and not final_text_parts:
+                        await _emit_text_delta(agent_final)
+                    if agent_final and not final_response_text:
+                        final_response_text = agent_final
                 if isinstance(result, dict) and result.get("error") and not final_response_text:
                     agent_error = _redact_api_error_text(result["error"])
             except Exception as e:  # noqa: BLE001
@@ -6101,12 +6399,20 @@ class APIServerAdapter(BasePlatformAdapter):
             if agent_error:
                 failed_env = _envelope("failed")
                 failed_env["output"] = final_items
-                failed_env["error"] = {"message": _redact_api_error_text(agent_error), "type": "server_error"}
+                failed_env["error"] = {
+                    "message": _redact_api_error_text(agent_error), "type": "server_error",
+                    "code": "structured_output_validation_failed" if structured_output_failed else "agent_error",
+                }
                 failed_env["usage"] = {
                     "input_tokens": usage.get("input_tokens", 0),
                     "output_tokens": usage.get("output_tokens", 0),
                     "total_tokens": usage.get("total_tokens", 0),
                 }
+                failed_env["hermes"] = _hermes_sidecar(
+                    session_id=(result or {}).get("session_id", session_id), contract=output_contract,
+                    compressed=bool((result or {}).get("_compressed")), validated=not bool(output_contract),
+                    **(sidecar_context or {"continuation": "new", "route": "default"}),
+                )
                 _failed_history = list(conversation_history)
                 _failed_history.append({"role": "user", "content": user_message})
                 if final_response_text or agent_error:
@@ -6119,6 +6425,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     conversation_history_snapshot=_failed_history,
                 )
                 terminal_snapshot_persisted = True
+                await _write_event("hermes.sidecar", failed_env["hermes"])
                 await _write_event("response.failed", {
                     "type": "response.failed",
                     "response": failed_env,
@@ -6131,6 +6438,11 @@ class APIServerAdapter(BasePlatformAdapter):
                     "output_tokens": usage.get("output_tokens", 0),
                     "total_tokens": usage.get("total_tokens", 0),
                 }
+                completed_env["hermes"] = _hermes_sidecar(
+                    session_id=(result or {}).get("session_id", session_id), contract=output_contract,
+                    compressed=bool((result or {}).get("_compressed")),
+                    **(sidecar_context or {"continuation": "new", "route": "default"}),
+                )
                 full_history = self._build_response_conversation_history(
                     conversation_history,
                     user_message,
@@ -6148,6 +6460,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     session_id_snapshot=_result_sid if isinstance(_result_sid, str) and _result_sid else None,
                 )
                 terminal_snapshot_persisted = True
+                await _write_event("hermes.sidecar", completed_env["hermes"])
                 await _write_event("response.completed", {
                     "type": "response.completed",
                     "response": completed_env,
@@ -6349,6 +6662,25 @@ class APIServerAdapter(BasePlatformAdapter):
         )
         if selection_error:
             return web.json_response(_openai_error(selection_error), status=400)
+        try:
+            text_config = body.get("text")
+            output_contract = _structured_output_contract(
+                text_config.get("format") if isinstance(text_config, dict) else text_config,
+                responses=True,
+            )
+        except ValueError as exc:
+            return web.json_response(
+                _openai_error(str(exc), code="invalid_response_format"), status=400
+            )
+        sidecar_context = {
+            "continuation": "conversation" if conversation else (
+                "caller_history" if raw_history else (
+                    "previous_response_id" if previous_response_id else "new"
+                )
+            ),
+            "route": body.get("model") if route else "default",
+            "structured_output_capable": False,
+        }
         if stream:
             # Streaming branch — emit OpenAI Responses SSE events as the
             # agent runs so frontends can render text deltas and tool
@@ -6404,6 +6736,8 @@ class APIServerAdapter(BasePlatformAdapter):
                 gateway_session_key=gateway_session_key,
                 **agent_overrides,
                 route=route,
+                output_contract=output_contract,
+                defer_persistence=bool(output_contract),
             ))
             # Ensure SSE drain loops can terminate without relying on polling
             # agent_task.done(), which can race with queue timeout checks.
@@ -6428,10 +6762,80 @@ class APIServerAdapter(BasePlatformAdapter):
                 store=store,
                 session_id=session_id,
                 gateway_session_key=gateway_session_key,
+                output_contract=output_contract,
+                sidecar_context=sidecar_context,
             )
 
+        response_id = f"resp_{uuid.uuid4().hex[:28]}"
+        created_at = int(time.time())
+        model_name = body.get("model", self._model_name)
+
+        def _failed_response(
+            message: Any, *, status: int, code: str, validated: bool,
+        ) -> "web.Response":
+            safe_message = _redact_api_error_text(message)
+            failure_result = getattr(message, "result", None)
+            if not isinstance(failure_result, dict):
+                failure_result = {}
+            effective_session_id = failure_result.get("session_id") or session_id
+            compressed = bool(failure_result.get("_compressed"))
+            failed_data = {
+                "id": response_id,
+                "object": "response",
+                "status": "failed",
+                "created_at": created_at,
+                "model": model_name,
+                "output": [],
+                **_openai_error(safe_message, err_type="server_error", code=code),
+            }
+            failed_data["hermes"] = _hermes_sidecar(
+                session_id=effective_session_id,
+                contract=output_contract,
+                compressed=compressed,
+                validated=validated,
+                **sidecar_context,
+            )
+            if store:
+                result_messages = failure_result.get("messages")
+                if isinstance(result_messages, list) and result_messages:
+                    sanitized_messages = [
+                        dict(item) if isinstance(item, dict) else item
+                        for item in result_messages
+                    ]
+                    tail = sanitized_messages[-1]
+                    if isinstance(tail, dict) and tail.get("role") == "assistant":
+                        tail["content"] = safe_message
+                        tail.pop("api_content", None)
+                        tail.pop("codex_message_items", None)
+                    else:
+                        sanitized_messages.append({
+                            "role": "assistant", "content": safe_message,
+                        })
+                    sanitized_result = dict(failure_result)
+                    sanitized_result["messages"] = sanitized_messages
+                else:
+                    sanitized_result = failure_result
+                failed_history = self._build_response_conversation_history(
+                    conversation_history,
+                    user_message,
+                    sanitized_result,
+                    safe_message,
+                )
+                self._response_store.put(response_id, {
+                    "response": failed_data,
+                    "conversation_history": failed_history,
+                    "instructions": instructions,
+                    "session_id": effective_session_id,
+                })
+                if conversation:
+                    self._response_store.set_conversation(conversation, response_id)
+            headers = {"X-Hermes-Session-Id": effective_session_id}
+            if gateway_session_key:
+                headers["X-Hermes-Session-Key"] = gateway_session_key
+            return web.json_response(failed_data, status=status, headers=headers)
+
         async def _compute_response():
-            return await self._run_agent(
+            return await self._run_agent_with_structured_output_repair(
                 user_message=user_message,
                 conversation_history=conversation_history,
                 ephemeral_system_prompt=instructions,
@@ -6439,6 +6843,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 gateway_session_key=gateway_session_key,
                 **agent_overrides,
                 route=route,
+                output_contract=output_contract,
             )
 
         idempotency_key = request.headers.get("Idempotency-Key")
@@ -6454,36 +6859,68 @@ class APIServerAdapter(BasePlatformAdapter):
                     "provider",
                     "model_options",
                     "tools",
+                    "text",
                 ],
             )
             try:
                 result, usage = await _idem_cache.get_or_set(
                     idempotency_key, fp, _compute_response
                 )
+            except StructuredOutputRequestError as exc:
+                return web.json_response(
+                    _openai_error(str(exc), code="structured_output_unsupported"), status=400
+                )
+            except StructuredOutputValidationError as exc:
+                return _failed_response(
+                    exc, status=502, code="structured_output_validation_failed", validated=False
+                )
             except Exception as e:
                 logger.error("Error running agent for responses: %s", e, exc_info=True)
-                return web.json_response(
-                    _openai_error(
-                        f"Internal server error: {e}", err_type="server_error"
-                    ),
+                return _failed_response(
+                    f"Internal server error: {e}",
                     status=500,
+                    code="agent_error",
+                    validated=not bool(output_contract),
                 )
         else:
             try:
                 result, usage = await _compute_response()
+            except StructuredOutputRequestError as exc:
+                return web.json_response(
+                    _openai_error(str(exc), code="structured_output_unsupported"), status=400
+                )
+            except StructuredOutputValidationError as exc:
+                return _failed_response(
+                    exc, status=502, code="structured_output_validation_failed", validated=False
+                )
             except Exception as e:
                 logger.error("Error running agent for responses: %s", e, exc_info=True)
-                return web.json_response(
-                    _openai_error(f"Internal server error: {e}", err_type="server_error"),
+                return _failed_response(
+                    f"Internal server error: {e}",
                     status=500,
+                    code="agent_error",
+                    validated=not bool(output_contract),
                 )
 
+        sidecar_context["structured_output_capable"] = bool(
+            result.get("_structured_output_capable")
+        )
+
         final_response = _resolve_media_to_data_urls(result.get("final_response", ""))
+        try:
+            final_response = _validated_structured_output(output_contract, final_response)
+        except StructuredOutputValidationError as exc:
+            return _failed_response(
+                StructuredOutputValidationError(str(exc), result=result),
+                status=502,
+                code="structured_output_validation_failed",
+                validated=False,
+            )
+        if output_contract:
+            result = dict(result)
+            result["final_response"] = final_response
         if not final_response:
             final_response = _redact_api_error_text(result.get("error", "(No response generated)"))
-
-        response_id = f"resp_{uuid.uuid4().hex[:28]}"
-        created_at = int(time.time())
 
         # Build the full conversation history for storage
         # (includes tool calls from the agent run)
@@ -6519,7 +6956,7 @@ class APIServerAdapter(BasePlatformAdapter):
             "object": "response",
             "status": "completed",
             "created_at": created_at,
-            "model": body.get("model", self._model_name),
+            "model": model_name,
             "output": output_items,
             "usage": {
                 "input_tokens": usage.get("input_tokens", 0),
@@ -6527,6 +6964,10 @@ class APIServerAdapter(BasePlatformAdapter):
                 "total_tokens": usage.get("total_tokens", 0),
             },
         }
+        response_data["hermes"] = _hermes_sidecar(
+            session_id=_effective_session_id, contract=output_contract,
+            compressed=bool(result.get("_compressed")), **sidecar_context,
+        )
 
         # Store the complete response object for future chaining / GET retrieval
         if store:
@@ -7244,6 +7685,149 @@ class APIServerAdapter(BasePlatformAdapter):
             cron_session="",
         )
 
+    @staticmethod
+    def _validated_structured_result(
+        result: Optional[Dict[str, Any]], normalized: str,
+    ) -> Dict[str, Any]:
+        """Canonicalize every persisted copy of the original final answer."""
+        clean = dict(result or {})
+        messages = clean.get("messages")
+        if isinstance(messages, list) and messages:
+            messages = [
+                dict(message) if isinstance(message, dict) else message
+                for message in messages
+            ]
+            for index in range(len(messages) - 1, -1, -1):
+                message = messages[index]
+                if isinstance(message, dict) and message.get("role") == "assistant":
+                    message["content"] = normalized
+                    message.pop("api_content", None)
+                    message.pop("codex_message_items", None)
+                    break
+            clean["messages"] = messages
+        clean["final_response"] = normalized
+        return clean
+
+    @staticmethod
+    async def _commit_validated_structured_turn(
+        agent: Any,
+        result: Dict[str, Any],
+        conversation_history: List[Dict[str, Any]],
+        user_message: Any,
+    ) -> None:
+        messages = result.get("messages")
+        if agent is None or not isinstance(messages, list):
+            return
+
+        def _commit() -> None:
+            agent._persist_disabled = False
+            agent._session_messages = messages
+            agent._save_session_log(messages)
+            agent._flush_messages_to_session_db(messages, conversation_history)
+            agent._sync_external_memory_for_turn(
+                original_user_message=user_message,
+                final_response=result["final_response"],
+                interrupted=False,
+                messages=messages,
+            )
+
+        await asyncio.to_thread(_commit)
+
+    async def _run_agent_with_structured_output_repair(
+        self,
+        *,
+        user_message: str,
+        conversation_history: List[Dict[str, str]],
+        ephemeral_system_prompt: Optional[str],
+        session_id: Optional[str],
+        gateway_session_key: Optional[str],
+        route: Optional[Dict[str, Any]],
+        output_contract: Optional[Dict[str, Any]],
+        requested_model: Optional[str] = None,
+        requested_provider: Optional[str] = None,
+        model_options: Optional[Dict[str, Any]] = None,
+    ) -> tuple:
+        """Run once, then make one contract-preserving repair turn if needed.
+
+        Provider schema controls are advisory for some configured models. The
+        API boundary still owns its advertised output contract, so a rejected
+        non-streaming result gets one internal correction turn rather than
+        forcing the client to resubmit the entire request.
+        """
+        initial_agent_ref = [None]
+        result, usage = await self._run_agent(
+            user_message=user_message,
+            conversation_history=conversation_history,
+            ephemeral_system_prompt=ephemeral_system_prompt,
+            session_id=session_id,
+            gateway_session_key=gateway_session_key,
+            route=route,
+            requested_model=requested_model,
+            requested_provider=requested_provider,
+            model_options=model_options,
+            output_contract=output_contract,
+            agent_ref=initial_agent_ref,
+            defer_persistence=bool(output_contract),
+        )
+        if not output_contract:
+            return result, usage
+
+        initial_result = result
+        run_error = _structured_run_error(result)
+        if run_error:
+            raise StructuredOutputValidationError(run_error, result=initial_result)
+        raw_response = _resolve_media_to_data_urls(result.get("final_response") or "")
+        try:
+            normalized = _validated_structured_output(output_contract, raw_response)
+        except StructuredOutputValidationError as first_error:
+            logger.warning(
+                "Structured output validation failed; attempting one API-owned repair "
+                "(type=%s strict=%s error=%s)",
+                output_contract["type"], output_contract.get("strict", False), first_error,
+            )
+            repair_history = list(conversation_history)
+            repair_history.extend((
+                {"role": "user", "content": user_message},
+                {"role": "assistant", "content": raw_response},
+            ))
+            repair_system_prompt = "\n\n".join(
+                prompt for prompt in (ephemeral_system_prompt, _STRUCTURED_OUTPUT_REPAIR_INSTRUCTION) if prompt
+            )
+            repair_result, repair_usage = await self._run_agent(
+                user_message=_STRUCTURED_OUTPUT_REPAIR_INSTRUCTION,
+                conversation_history=repair_history,
+                ephemeral_system_prompt=repair_system_prompt,
+                session_id=session_id,
+                gateway_session_key=gateway_session_key,
+                route=route,
+                requested_model=requested_model,
+                requested_provider=requested_provider,
+                model_options=model_options,
+                output_contract=output_contract,
+                format_only=True,
+            )
+            repair_error = _structured_run_error(repair_result)
+            if repair_error:
+                raise StructuredOutputValidationError(repair_error, result=initial_result)
+            raw_response = _resolve_media_to_data_urls(repair_result.get("final_response") or "")
+            try:
+                normalized = _validated_structured_output(output_contract, raw_response)
+            except StructuredOutputValidationError as exc:
+                raise StructuredOutputValidationError(
+                    str(exc), result=initial_result
+                ) from exc
+            usage = {
+                key: (usage.get(key, 0) or 0) + (repair_usage.get(key, 0) or 0)
+                for key in ("input_tokens", "output_tokens", "total_tokens")
+            }
+            logger.info("Structured output repair succeeded (type=%s)", output_contract["type"])
+
+        result = self._validated_structured_result(initial_result, normalized)
+        await self._commit_validated_structured_turn(
+            initial_agent_ref[0], result, conversation_history, user_message
+        )
+        return result, usage
+
     async def _run_agent(
         self,
         user_message: str,
@@ -7265,6 +7849,9 @@ class APIServerAdapter(BasePlatformAdapter):
         requested_runtime: Optional[Dict[str, Any]] = None,
         route_source: str = "global",
         confirmed_runtime_lock: bool = False,
+        output_contract: Optional[Dict[str, Any]] = None,
+        format_only: bool = False,
+        defer_persistence: bool = False,
     ) -> tuple:
         """
         Create an agent and run a conversation in a thread executor.
@@ -7336,6 +7923,9 @@ class APIServerAdapter(BasePlatformAdapter):
                         route=route,
                         session_model=session_model,
                         confirmed_runtime_lock=confirmed_runtime_lock,
+                        output_contract=output_contract,
+                        format_only=format_only,
+                        defer_persistence=defer_persistence,
                     )
                     if agent_ref is not None:
                         agent_ref[0] = agent
@@ -7383,6 +7973,10 @@ class APIServerAdapter(BasePlatformAdapter):
                     )
                     if _compacted_in_place or _session_rotated:
                         result["_compressed"] = True
+                    if output_contract:
+                        result["_structured_output_capable"] = bool(
+                            getattr(agent, "_structured_output_capable", False)
+                        )
                     include_runtime = bool(
                         requested_runtime
                         or route
