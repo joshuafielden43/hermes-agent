@@ -10,6 +10,7 @@ from aiohttp.test_utils import TestClient, TestServer
 from gateway.config import PlatformConfig
 from gateway.platforms.api_server import (
     APIServerAdapter,
+    _ProviderAuthResolutionError,
     StructuredOutputRequestError,
     StructuredOutputValidationError,
     _structured_output_contract,
@@ -262,6 +263,27 @@ async def test_responses_stream_provider_failure_is_not_schema_failure():
     assert "event: response.failed" in body
     assert '"code": "agent_error"' in body
     assert "structured_output_validation_failed" not in body
+
+
+@pytest.mark.asyncio
+async def test_responses_stream_provider_auth_failure_is_agent_error():
+    adapter = _adapter()
+
+    with patch.object(
+        adapter,
+        "_create_agent",
+        side_effect=_ProviderAuthResolutionError("provider credential unavailable"),
+    ):
+        async with TestClient(TestServer(_app(adapter))) as client:
+            response = await client.post(
+                "/v1/responses", json=_payload("responses", stream=True)
+            )
+            body = await response.text()
+
+    assert "event: response.failed" in body
+    assert '"code": "agent_error"' in body
+    assert "structured_output_validation_failed" not in body
+    assert "event: response.output_text.delta" not in body
 
 
 @pytest.mark.asyncio
