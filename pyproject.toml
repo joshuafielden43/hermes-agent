@@ -57,7 +57,7 @@ dependencies = [
   # self-heal path for lean/broken installs — keep the pin below and the
   # lazy pin in lockstep.
   "firecrawl-anydoc==0.2.4",
-  "jsonschema==4.26.0",
+  "jsonschema>=4.26.0,<5",
   # Bumped from 2.12.5 to 2.13.4 to pull in pydantic-core 2.46.4.
   # pydantic-core 2.41.5 (pulled by 2.12.5) segfaults when the OpenAI SDK's
   # Responses API resource is exercised from a non-main thread, which is the
