@@ -1,7 +1,7 @@
 """Provider-wire mapping for API-server structured-output constraints.
 
 Adapted from the normalization and wire-mapping work in NousResearch/hermes-agent
-PR #39595 by Miguel Figueiredo.  Boundary validation and persistence remain owned
+PR #39595 by Miguel Fernandez.  Boundary validation and persistence remain owned
 by the API server; this leaf module only describes transport support and shape.
 """
 

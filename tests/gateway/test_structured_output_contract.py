@@ -97,6 +97,31 @@ def test_contract_parser_validates_without_schema_retrieval():
         )
 
 
+@pytest.mark.parametrize(("value", "responses"), (
+    ({"type": "text", "unexpected": True}, False),
+    ({"type": "json_object", "unexpected": True}, True),
+    ({"type": "json_schema", "json_schema": {
+        "name": "answer", "schema": {"type": "object"}, "unexpected": True,
+    }}, False),
+    ({
+        "type": "json_schema", "name": "answer",
+        "schema": {"type": "object"}, "unexpected": True,
+    }, True),
+))
+def test_contract_parser_rejects_unknown_fields(value, responses):
+    with pytest.raises(ValueError, match="unsupported fields"):
+        _structured_output_contract(value, responses=responses)
+
+
+def test_contract_validator_rejects_numeric_overflow():
+    contract = _structured_output_contract(
+        {"type": "json_object"}, responses=False
+    )
+
+    with pytest.raises(StructuredOutputValidationError, match="finite"):
+        _validated_structured_output(contract, '{"value": 1e400}')
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(("surface", "path"), (
     ("chat", "/v1/chat/completions"),
@@ -200,6 +225,36 @@ async def test_nonstream_run_failure_is_agent_error(surface, path, failed_result
     assert body["error"]["code"] == "agent_error"
     assert "private assistant body" not in json.dumps(body)
     assert run.call_count == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("surface", "path"), (
+    ("chat", "/v1/chat/completions"),
+    ("responses", "/v1/responses"),
+))
+async def test_nonstream_failure_keeps_effective_capability_without_assistant_history(
+    surface, path
+):
+    adapter = _adapter()
+    failed = _result(
+        "private assistant body",
+        failed=True,
+        error="provider exploded",
+        _structured_output_capable=True,
+    )
+
+    async with TestClient(TestServer(_app(adapter))) as client:
+        with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as run:
+            run.return_value = (failed, _usage())
+            response = await client.post(path, json=_payload(surface))
+            body = await response.json()
+
+    assert response.status == 502
+    assert body["hermes"]["output_contract"]["route_capable"] is True
+    if surface == "responses":
+        stored = adapter._response_store.get(body["id"])
+        assert stored is not None
+        assert [item["role"] for item in stored["conversation_history"]] == ["user"]
 
 
 @pytest.mark.asyncio
@@ -328,7 +383,13 @@ async def test_responses_stream_provider_failure_is_not_schema_failure():
     adapter = _adapter()
 
     async def run(**kwargs):
-        return _result("", failed=True, completed=False, error="provider exploded"), _usage()
+        return _result(
+            "private assistant body",
+            failed=True,
+            completed=False,
+            error="provider exploded",
+            _structured_output_capable=True,
+        ), _usage()
 
     async with TestClient(TestServer(_app(adapter))) as client:
         with patch.object(adapter, "_run_agent", side_effect=run):
@@ -340,6 +401,60 @@ async def test_responses_stream_provider_failure_is_not_schema_failure():
     assert "event: response.failed" in body
     assert '"code": "agent_error"' in body
     assert "structured_output_validation_failed" not in body
+    assert "private assistant body" not in body
+    failed_event = next(
+        json.loads(line.removeprefix("data: "))
+        for line in body.splitlines()
+        if line.startswith("data: ") and '"type": "response.failed"' in line
+    )
+    failed_response = failed_event["response"]
+    assert failed_response["hermes"]["output_contract"]["route_capable"] is True
+    stored = adapter._response_store.get(failed_response["id"])
+    assert stored is not None
+    assert [item["role"] for item in stored["conversation_history"]] == ["user"]
+
+
+@pytest.mark.asyncio
+async def test_responses_stream_unexpected_failure_persists_terminal_sidecar():
+    adapter = _adapter()
+    original_write = web.StreamResponse.write
+    failed_once = False
+
+    async def fail_one_terminal_item(response, data):
+        nonlocal failed_once
+        if not failed_once and b"event: response.output_text.done" in data:
+            failed_once = True
+            raise RuntimeError("event write failed")
+        return await original_write(response, data)
+
+    async def run(**kwargs):
+        kwargs["stream_delta_callback"]("partial")
+        return _result('{"answer": 42}'), _usage()
+
+    async with TestClient(TestServer(_app(adapter))) as client:
+        with (
+            patch.object(adapter, "_run_agent", side_effect=run),
+            patch.object(web.StreamResponse, "write", new=fail_one_terminal_item),
+        ):
+            response = await client.post(
+                "/v1/responses", json=_payload("responses", stream=True)
+            )
+            body = await response.text()
+
+    assert "event: hermes.sidecar" in body
+    assert "event: response.failed" in body
+    failed_event = next(
+        json.loads(line.removeprefix("data: "))
+        for line in body.splitlines()
+        if line.startswith("data: ") and '"type": "response.failed"' in line
+    )
+    failed_response = failed_event["response"]
+    assert failed_response["hermes"]["output_contract"]["mode"] == "json_object"
+    stored = adapter._response_store.get(failed_response["id"])
+    assert stored is not None
+    assert stored["response"]["status"] == "failed"
+    assert stored["response"]["hermes"] == failed_response["hermes"]
+    assert [item["role"] for item in stored["conversation_history"]] == ["user"]
 
 
 @pytest.mark.asyncio
@@ -488,6 +603,38 @@ def test_unsupported_effective_mode_fails_closed(monkeypatch):
 
     with pytest.raises(StructuredOutputRequestError, match="not supported"):
         adapter._create_agent(output_contract=contract)
+
+
+def test_real_runtime_config_propagates_contract_to_agent(
+    tmp_path, monkeypatch
+):
+    hermes_home = tmp_path / "hermes"
+    hermes_home.mkdir()
+    (hermes_home / "config.yaml").write_text(
+        "model:\n  provider: openrouter\n  default: openai/gpt-4o-mini\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
+    monkeypatch.delenv("HERMES_PROFILE", raising=False)
+    from gateway import run as gateway_run
+
+    monkeypatch.setattr(gateway_run, "_hermes_home", hermes_home)
+    adapter = _adapter()
+    contract = _structured_output_contract(
+        {"type": "json_object"}, responses=False
+    )
+
+    agent = adapter._create_agent(
+        output_contract=contract,
+        defer_persistence=True,
+    )
+
+    assert agent.provider == "openrouter"
+    assert agent.model == "openai/gpt-4o-mini"
+    assert agent.request_overrides["response_format"] == {"type": "json_object"}
+    assert agent._persist_disabled is True
+
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(("surface", "path"), (
