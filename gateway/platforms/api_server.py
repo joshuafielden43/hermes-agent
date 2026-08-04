@@ -245,6 +245,10 @@ class StructuredOutputValidationError(ValueError):
 class StructuredOutputRunError(RuntimeError):
     """The agent run failed before producing output that can be validated."""
 
+    def __init__(self, message: str, *, result: Optional[Dict[str, Any]] = None):
+        super().__init__(message)
+        self.result = result
+
 
 class StructuredOutputRequestError(ValueError):
     """The effective provider runtime cannot honor the caller's contract."""
@@ -287,6 +291,16 @@ def _structured_output_contract(value: Any, *, responses: bool) -> Optional[Dict
     if not isinstance(value, dict):
         raise ValueError("response format must be an object")
     kind = value.get("type")
+    allowed = (
+        {"type", "name", "description", "schema", "strict"}
+        if responses and kind == "json_schema"
+        else {"type", "json_schema"}
+        if kind == "json_schema"
+        else {"type"}
+    )
+    unknown = sorted(set(value) - allowed)
+    if unknown:
+        raise ValueError(f"response format has unsupported fields: {', '.join(unknown)}")
     if kind == "text":
         return None
     if kind == "json_object":
@@ -297,6 +311,12 @@ def _structured_output_contract(value: Any, *, responses: bool) -> Optional[Dict
     schema_spec = value if responses else value.get("json_schema")
     if not isinstance(schema_spec, dict):
         raise ValueError("json_schema requires a json_schema object")
+    schema_fields = {"name", "description", "schema", "strict"}
+    if responses:
+        schema_fields.add("type")
+    unknown = sorted(set(schema_spec) - schema_fields)
+    if unknown:
+        raise ValueError(f"json_schema has unsupported fields: {', '.join(unknown)}")
     name = schema_spec.get("name")
     schema = schema_spec.get("schema")
     strict = schema_spec.get("strict", False)
@@ -338,6 +358,10 @@ def _validated_structured_output(contract: Optional[Dict[str, Any]], text: str) 
         parsed = json.loads(payload, parse_constant=_reject_nonfinite)
     except (json.JSONDecodeError, ValueError) as exc:
         raise StructuredOutputValidationError("model output was not valid JSON") from exc
+    try:
+        canonical = json.dumps(parsed, ensure_ascii=False, allow_nan=False)
+    except ValueError as exc:
+        raise StructuredOutputValidationError("model output JSON must be finite") from exc
     if contract["type"] == "json_object" and not isinstance(parsed, dict):
         raise StructuredOutputValidationError("model output was not a JSON object")
     if contract["type"] == "json_schema":
@@ -347,7 +371,7 @@ def _validated_structured_output(contract: Optional[Dict[str, Any]], text: str) 
             ).validate(parsed)
         except (jsonschema.ValidationError, Unresolvable) as exc:
             raise StructuredOutputValidationError("model output did not match the requested JSON Schema") from exc
-    return json.dumps(parsed, ensure_ascii=False)
+    return canonical
 
 
 _STRUCTURED_OUTPUT_REPAIR_INSTRUCTION = """Your immediately preceding final answer was rejected because it did not satisfy the response format for this API request. Return a corrected replacement now. Output exactly one JSON value that conforms to the existing requested response format. Do not include Markdown, prose, explanations, or tool calls."""
@@ -370,6 +394,18 @@ def _hermes_sidecar(
         "route": route,
         "reasoning": {"mode": "provider_managed", "exposed": False},
     }
+
+
+def _failure_sidecar_context(
+    context: Dict[str, Any], error: BaseException,
+) -> Dict[str, Any]:
+    merged = dict(context)
+    result = getattr(error, "result", None)
+    if isinstance(result, dict) and "_structured_output_capable" in result:
+        merged["structured_output_capable"] = bool(
+            result["_structured_output_capable"]
+        )
+    return merged
 
 
 def _hermes_version() -> str:
@@ -1625,6 +1661,10 @@ class _ProviderAuthResolutionError(RuntimeError):
     closed OpenAI client"), which a bare `except RuntimeError` there would
     otherwise mislabel as an auth failure.
     """
+
+    def __init__(self, message: str, *, result: Optional[Dict[str, Any]] = None):
+        super().__init__(message)
+        self.result = result
 
 
 class APIServerAdapter(BasePlatformAdapter):
@@ -5517,11 +5557,11 @@ class APIServerAdapter(BasePlatformAdapter):
                 )
             except (_ProviderAuthResolutionError, StructuredOutputRunError) as exc:
                 error = _openai_error(str(exc), err_type="server_error", code="agent_error")
-                error["hermes"] = _hermes_sidecar(session_id=session_id, contract=output_contract, validated=False, **sidecar_context)
+                error["hermes"] = _hermes_sidecar(session_id=session_id, contract=output_contract, validated=False, **_failure_sidecar_context(sidecar_context, exc))
                 return web.json_response(error, status=502)
             except StructuredOutputValidationError as exc:
                 error = _openai_error(str(exc), err_type="server_error", code="structured_output_validation_failed")
-                error["hermes"] = _hermes_sidecar(session_id=session_id, contract=output_contract, validated=False, **sidecar_context)
+                error["hermes"] = _hermes_sidecar(session_id=session_id, contract=output_contract, validated=False, **_failure_sidecar_context(sidecar_context, exc))
                 return web.json_response(error, status=502)
             except Exception as e:
                 logger.error("Error running agent for chat completions: %s", e, exc_info=True)
@@ -5538,11 +5578,11 @@ class APIServerAdapter(BasePlatformAdapter):
                 )
             except (_ProviderAuthResolutionError, StructuredOutputRunError) as exc:
                 error = _openai_error(str(exc), err_type="server_error", code="agent_error")
-                error["hermes"] = _hermes_sidecar(session_id=session_id, contract=output_contract, validated=False, **sidecar_context)
+                error["hermes"] = _hermes_sidecar(session_id=session_id, contract=output_contract, validated=False, **_failure_sidecar_context(sidecar_context, exc))
                 return web.json_response(error, status=502)
             except StructuredOutputValidationError as exc:
                 error = _openai_error(str(exc), err_type="server_error", code="structured_output_validation_failed")
-                error["hermes"] = _hermes_sidecar(session_id=session_id, contract=output_contract, validated=False, **sidecar_context)
+                error["hermes"] = _hermes_sidecar(session_id=session_id, contract=output_contract, validated=False, **_failure_sidecar_context(sidecar_context, exc))
                 return web.json_response(error, status=502)
             except Exception as e:
                 logger.error("Error running agent for chat completions: %s", e, exc_info=True)
@@ -5971,10 +6011,11 @@ class APIServerAdapter(BasePlatformAdapter):
 
         async def _write_event(event_type: str, data: Dict[str, Any]) -> None:
             nonlocal sequence_number
-            if "sequence_number" not in data:
-                data["sequence_number"] = sequence_number
+            event_data = dict(data)
+            if "sequence_number" not in event_data:
+                event_data["sequence_number"] = sequence_number
             sequence_number += 1
-            await response.write(_sse_frame(data, event=event_type))
+            await response.write(_sse_frame(event_data, event=event_type))
 
         def _envelope(status: str) -> Dict[str, Any]:
             env: Dict[str, Any] = {
@@ -6401,14 +6442,6 @@ class APIServerAdapter(BasePlatformAdapter):
                                 _first["text"] = _text[:500] + "...[" + str(len(_text) - 500) + " more chars]"
                                 _item["output"] = [_first]
 
-            final_items.append({
-                "type": "message",
-                "role": "assistant",
-                "content": [
-                    {"type": "output_text", "text": final_response_text or (_redact_api_error_text(agent_error) if agent_error else "")}
-                ],
-            })
-
             if agent_error:
                 failed_env = _envelope("failed")
                 failed_env["output"] = final_items
@@ -6428,11 +6461,6 @@ class APIServerAdapter(BasePlatformAdapter):
                 )
                 _failed_history = list(conversation_history)
                 _failed_history.append({"role": "user", "content": user_message})
-                if final_response_text or agent_error:
-                    _failed_history.append({
-                        "role": "assistant",
-                        "content": final_response_text or _redact_api_error_text(agent_error),
-                    })
                 _persist_response_snapshot(
                     failed_env,
                     conversation_history_snapshot=_failed_history,
@@ -6444,6 +6472,13 @@ class APIServerAdapter(BasePlatformAdapter):
                     "response": failed_env,
                 })
             else:
+                final_items.append({
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [
+                        {"type": "output_text", "text": final_response_text}
+                    ],
+                })
                 completed_env = _envelope("completed")
                 completed_env["output"] = final_items
                 completed_env["usage"] = {
@@ -6526,7 +6561,6 @@ class APIServerAdapter(BasePlatformAdapter):
             # event and properly terminate the SSE stream so the client doesn't
             # get a TransferEncodingError from incomplete chunked encoding.
             import traceback as _tb
-            _persist_incomplete_if_needed()
             agent_error = _redact_api_error_text(_tb.format_exc())
             try:
                 failed_env = _envelope("failed")
@@ -6537,6 +6571,19 @@ class APIServerAdapter(BasePlatformAdapter):
                     "output_tokens": usage.get("output_tokens", 0),
                     "total_tokens": usage.get("total_tokens", 0),
                 }
+                failed_env["hermes"] = _hermes_sidecar(
+                    session_id=session_id, contract=output_contract,
+                    compressed=False, validated=not bool(output_contract),
+                    **(sidecar_context or {"continuation": "new", "route": "default"}),
+                )
+                failed_history = list(conversation_history)
+                failed_history.append({"role": "user", "content": user_message})
+                _persist_response_snapshot(
+                    failed_env,
+                    conversation_history_snapshot=failed_history,
+                )
+                terminal_snapshot_persisted = True
+                await _write_event("hermes.sidecar", failed_env["hermes"])
                 await _write_event("response.failed", {
                     "type": "response.failed",
                     "response": failed_env,
@@ -6792,6 +6839,9 @@ class APIServerAdapter(BasePlatformAdapter):
                 failure_result = {}
             effective_session_id = failure_result.get("session_id") or session_id
             compressed = bool(failure_result.get("_compressed"))
+            failure_sidecar_context = _failure_sidecar_context(
+                sidecar_context, message
+            )
             failed_data = {
                 "id": response_id,
                 "object": "response",
@@ -6806,34 +6856,11 @@ class APIServerAdapter(BasePlatformAdapter):
                 contract=output_contract,
                 compressed=compressed,
                 validated=validated,
-                **sidecar_context,
+                **failure_sidecar_context,
             )
             if store:
-                result_messages = failure_result.get("messages")
-                if isinstance(result_messages, list) and result_messages:
-                    sanitized_messages = [
-                        dict(item) if isinstance(item, dict) else item
-                        for item in result_messages
-                    ]
-                    tail = sanitized_messages[-1]
-                    if isinstance(tail, dict) and tail.get("role") == "assistant":
-                        tail["content"] = safe_message
-                        tail.pop("api_content", None)
-                        tail.pop("codex_message_items", None)
-                    else:
-                        sanitized_messages.append({
-                            "role": "assistant", "content": safe_message,
-                        })
-                    sanitized_result = dict(failure_result)
-                    sanitized_result["messages"] = sanitized_messages
-                else:
-                    sanitized_result = failure_result
-                failed_history = self._build_response_conversation_history(
-                    conversation_history,
-                    user_message,
-                    sanitized_result,
-                    safe_message,
-                )
+                failed_history = list(conversation_history)
+                failed_history.append({"role": "user", "content": user_message})
                 self._response_store.put(response_id, {
                     "response": failed_data,
                     "conversation_history": failed_history,
@@ -7769,11 +7796,11 @@ class APIServerAdapter(BasePlatformAdapter):
         provider_auth_error = result.get("_provider_auth_error") if isinstance(result, dict) else None
         if provider_auth_error:
             raise _ProviderAuthResolutionError(
-                _redact_api_error_text(provider_auth_error)
+                _redact_api_error_text(provider_auth_error), result=result
             )
         run_error = _structured_run_error(result)
         if run_error:
-            raise StructuredOutputRunError(run_error)
+            raise StructuredOutputRunError(run_error, result=result)
         raw_response = _resolve_media_to_data_urls(result.get("final_response") or "")
         try:
             normalized = _validated_structured_output(output_contract, raw_response)
@@ -7811,11 +7838,12 @@ class APIServerAdapter(BasePlatformAdapter):
             )
             if repair_provider_auth_error:
                 raise _ProviderAuthResolutionError(
-                    _redact_api_error_text(repair_provider_auth_error)
+                    _redact_api_error_text(repair_provider_auth_error),
+                    result=repair_result,
                 )
             repair_error = _structured_run_error(repair_result)
             if repair_error:
-                raise StructuredOutputRunError(repair_error)
+                raise StructuredOutputRunError(repair_error, result=repair_result)
             raw_response = _resolve_media_to_data_urls(repair_result.get("final_response") or "")
             try:
                 normalized = _validated_structured_output(output_contract, raw_response)
