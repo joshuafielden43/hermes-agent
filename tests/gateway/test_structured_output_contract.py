@@ -147,6 +147,73 @@ async def test_nonstream_valid_contract_reaches_gateway_boundary(surface, path):
 
 
 @pytest.mark.asyncio
+async def test_responses_nonstream_emits_complete_output_message_shape():
+    adapter = _adapter()
+    async with TestClient(TestServer(_app(adapter))) as client:
+        with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as run:
+            run.return_value = (_result('{"answer": 42}'), _usage())
+            response = await client.post(
+                "/v1/responses", json=_payload("responses")
+            )
+            body = await response.json()
+
+    assert response.status == 200
+    message = body["output"][-1]
+    assert message["id"].startswith("msg_")
+    assert message["status"] == "completed"
+    assert message["role"] == "assistant"
+    assert message["content"] == [{
+        "type": "output_text",
+        "text": '{"answer": 42}',
+        "annotations": [],
+    }]
+
+
+@pytest.mark.asyncio
+async def test_responses_stream_reuses_complete_message_shape_in_terminal_events():
+    adapter = _adapter()
+
+    async def run(**kwargs):
+        kwargs["stream_delta_callback"]('{"answer": 42}')
+        return _result('{"answer": 42}'), _usage()
+
+    async with TestClient(TestServer(_app(adapter))) as client:
+        with patch.object(adapter, "_run_agent", side_effect=run):
+            response = await client.post(
+                "/v1/responses", json=_payload("responses", stream=True)
+            )
+            stream_body = await response.text()
+
+    events = [
+        json.loads(line.removeprefix("data: "))
+        for line in stream_body.splitlines()
+        if line.startswith("data: ")
+    ]
+    done_message = next(
+        event["item"]
+        for event in events
+        if event.get("type") == "response.output_item.done"
+        and event.get("item", {}).get("type") == "message"
+    )
+    completed_message = next(
+        item
+        for event in events
+        if event.get("type") == "response.completed"
+        for item in event["response"]["output"]
+        if item.get("type") == "message"
+    )
+
+    assert done_message == completed_message
+    assert completed_message["id"].startswith("msg_")
+    assert completed_message["status"] == "completed"
+    assert completed_message["content"] == [{
+        "type": "output_text",
+        "text": '{"answer": 42}',
+        "annotations": [],
+    }]
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(("surface", "path"), (
     ("chat", "/v1/chat/completions"),
     ("responses", "/v1/responses"),
