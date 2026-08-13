@@ -1407,6 +1407,31 @@ def _structured_run_error(result: Any) -> Optional[str]:
     return None
 
 
+def _response_output_message(
+    text: str,
+    *,
+    status: str,
+    message_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Build one OpenAI Responses assistant output-message item.
+
+    A message item is scoped to one response turn, not to the longer-lived
+    Hermes session.  Generate a distinct ``msg_`` identity unless the
+    streaming writer supplies the identity already used by its delta events.
+    """
+    return {
+        "id": message_id or f"msg_{uuid.uuid4().hex[:24]}",
+        "type": "message",
+        "status": status,
+        "role": "assistant",
+        "content": [{
+            "type": "output_text",
+            "text": text,
+            "annotations": [],
+        }],
+    }
+
+
 def _openai_error(message: str, err_type: str = "invalid_request_error", param: str = None, code: str = None) -> Dict[str, Any]:
     """OpenAI-style error envelope."""
     return {
@@ -6089,11 +6114,11 @@ class APIServerAdapter(BasePlatformAdapter):
             incomplete_text = "".join(final_text_parts) or final_response_text
             incomplete_items: List[Dict[str, Any]] = list(emitted_items)
             if incomplete_text:
-                incomplete_items.append({
-                    "type": "message",
-                    "role": "assistant",
-                    "content": [{"type": "output_text", "text": incomplete_text}],
-                })
+                incomplete_items.append(_response_output_message(
+                    incomplete_text,
+                    status="incomplete",
+                    message_id=message_item_id,
+                ))
             incomplete_env = _envelope("incomplete")
             incomplete_env["output"] = incomplete_items
             incomplete_env["usage"] = {
@@ -6410,6 +6435,11 @@ class APIServerAdapter(BasePlatformAdapter):
 
             # Close the message item if it was opened
             final_response_text = "".join(final_text_parts) or final_response_text
+            completed_message = _response_output_message(
+                final_response_text,
+                status="completed",
+                message_id=message_item_id,
+            )
             if message_opened:
                 await _write_event("response.output_text.done", {
                     "type": "response.output_text.done",
@@ -6419,19 +6449,10 @@ class APIServerAdapter(BasePlatformAdapter):
                     "text": final_response_text,
                     "logprobs": [],
                 })
-                msg_done_item = {
-                    "id": message_item_id,
-                    "type": "message",
-                    "status": "completed",
-                    "role": "assistant",
-                    "content": [
-                        {"type": "output_text", "text": final_response_text}
-                    ],
-                }
                 await _write_event("response.output_item.done", {
                     "type": "response.output_item.done",
                     "output_index": message_output_index,
-                    "item": msg_done_item,
+                    "item": completed_message,
                 })
 
             # Always append a final message item in the completed
@@ -6494,13 +6515,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     "response": failed_env,
                 })
             else:
-                final_items.append({
-                    "type": "message",
-                    "role": "assistant",
-                    "content": [
-                        {"type": "output_text", "text": final_response_text}
-                    ],
-                })
+                final_items.append(completed_message)
                 completed_env = _envelope("completed")
                 completed_env["output"] = final_items
                 completed_env["usage"] = {
@@ -7666,16 +7681,7 @@ class APIServerAdapter(BasePlatformAdapter):
         if not final:
             final = _redact_api_error_text(result.get("error", "(No response generated)"))
 
-        items.append({
-            "type": "message",
-            "role": "assistant",
-            "content": [
-                {
-                    "type": "output_text",
-                    "text": final,
-                }
-            ],
-        })
+        items.append(_response_output_message(final, status="completed"))
         return items
 
     # ------------------------------------------------------------------
