@@ -3604,7 +3604,12 @@ class APIServerAdapter(BasePlatformAdapter):
                 "run_stop": True,
                 "run_steer": True,
                 "run_approval_response": True,
+                # Supported on /v1/chat/completions streams but opt-in per
+                # request (header below, or body ``tool_progress_events``);
+                # the default stream is strictly OpenAI-shaped.
                 "tool_progress_events": True,
+                "tool_progress_opt_in": True,
+                "tool_progress_header": "X-Hermes-Tool-Progress",
                 "approval_events": True,
                 "session_resources": True,
                 "model_options": True,
@@ -5315,6 +5320,23 @@ class APIServerAdapter(BasePlatformAdapter):
 
         stream = _coerce_request_bool(body.get("stream"), default=False)
 
+        # Opt-in gate for the custom ``hermes.tool.progress`` SSE events
+        # (#6972/#16588).  Strict OpenAI-compatible consumers — anything
+        # whose SSE parser JSON-decodes every ``data:`` line as a
+        # ``chat.completion.chunk`` and ignores the ``event:`` name
+        # (Vercel AI SDK and clients built on it, e.g. n8n's LLM chat) —
+        # fail schema validation on the progress payload because it has
+        # no ``choices`` array, killing the whole turn.  The stream is
+        # therefore strictly OpenAI-shaped unless the caller asks for
+        # the events via the ``X-Hermes-Tool-Progress`` header or the
+        # ``tool_progress_events`` body flag.
+        tool_progress_opt_in = _coerce_request_bool(
+            body.get("tool_progress_events"), default=False
+        ) or (
+            request.headers.get("X-Hermes-Tool-Progress", "").strip().lower()
+            in _TRUE_REQUEST_BOOL_STRINGS
+        )
+
         # Extract system message (becomes ephemeral system prompt layered ON TOP of core)
         system_prompt = None
         conversation_messages: List[Dict[str, str]] = []
@@ -5526,6 +5548,12 @@ class APIServerAdapter(BasePlatformAdapter):
             # side-by-side with ``tool_start_callback``/``tool_complete_callback``.
             # The structured callbacks are strictly richer (they carry
             # the tool_call id), so they own the chat-completions SSE channel.
+            #
+            # Both callbacks are withheld entirely unless the caller opted
+            # in to ``hermes.tool.progress`` events (see
+            # ``tool_progress_opt_in`` above), keeping the default stream
+            # free of non-``chat.completion.chunk`` frames that strict
+            # OpenAI-compatible parsers reject.
             agent_ref = [None]
             agent_task = asyncio.ensure_future(self._run_agent(
                 user_message=user_message,
@@ -5533,8 +5561,8 @@ class APIServerAdapter(BasePlatformAdapter):
                 ephemeral_system_prompt=system_prompt,
                 session_id=session_id,
                 stream_delta_callback=_on_delta,
-                tool_start_callback=_on_tool_start,
-                tool_complete_callback=_on_tool_complete,
+                tool_start_callback=_on_tool_start if tool_progress_opt_in else None,
+                tool_complete_callback=_on_tool_complete if tool_progress_opt_in else None,
                 agent_ref=agent_ref,
                 gateway_session_key=gateway_session_key,
                 **agent_overrides,
