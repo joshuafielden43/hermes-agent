@@ -8,7 +8,7 @@ description: "Expose hermes-agent as an OpenAI-compatible API for any frontend"
 
 The API server exposes hermes-agent as an OpenAI-compatible HTTP endpoint. Any frontend that speaks the OpenAI format — Open WebUI, LobeChat, LibreChat, NextChat, ChatBox, and hundreds more — can connect to hermes-agent and use it as a backend.
 
-Your agent handles requests with its full toolset (terminal, file operations, web search, memory, skills) and returns the final response. When streaming, tool progress indicators appear inline so frontends can show what the agent is doing.
+Your agent handles requests with its full toolset (terminal, file operations, web search, memory, skills) and returns the final response. When streaming, frontends can opt in to inline tool progress indicators to show what the agent is doing.
 
 :::tip One backend covers models + tools
 Hermes itself needs a configured provider and tool backends for the API server to be useful. A [Nous Portal](/user-guide/features/tool-gateway) subscription handles both — 300+ models plus web/image/TTS/browser via the Tool Gateway. Run `hermes setup --portal` once before starting the API server and frontends like Open WebUI or LobeChat get a fully tool-equipped backend.
@@ -106,10 +106,10 @@ Standard OpenAI Chat Completions format. Stateless — the full conversation is 
 
 Uploaded files (`file` / `input_file` / `file_id`) and non-image `data:` URLs return `400 unsupported_content_type`.
 
-**Streaming** (`"stream": true`): Returns Server-Sent Events (SSE) with token-by-token response chunks. For **Chat Completions**, the stream uses standard `chat.completion.chunk` events plus Hermes' custom `hermes.tool.progress` event for tool-start UX. For **Responses**, the stream uses OpenAI Responses event types such as `response.created`, `response.output_text.delta`, `response.output_item.added`, `response.output_item.done`, and `response.completed`.
+**Streaming** (`"stream": true`): Returns Server-Sent Events (SSE) with token-by-token response chunks. For **Chat Completions**, the stream is strictly OpenAI-shaped by default: every `data:` payload is a standard `chat.completion.chunk` (many OpenAI-compatible clients — e.g. anything built on the Vercel AI SDK, such as n8n's LLM chat — JSON-decode every `data:` line and reject payloads that don't match the chunk schema). Frontends that want tool-start UX can opt in to Hermes' custom `hermes.tool.progress` event with the `X-Hermes-Tool-Progress: 1` request header or `"tool_progress_events": true` in the request body. For **Responses**, the stream uses OpenAI Responses event types such as `response.created`, `response.output_text.delta`, `response.output_item.added`, `response.output_item.done`, and `response.completed`.
 
 **Tool progress in streams**:
-- **Chat Completions**: Hermes emits `event: hermes.tool.progress` for tool-start visibility without polluting persisted assistant text.
+- **Chat Completions**: with the opt-in above, Hermes emits `event: hermes.tool.progress` for tool-start visibility without polluting persisted assistant text. Without it, tool activity produces no extra frames.
 - **Responses**: Hermes emits spec-native `function_call` and `function_call_output` output items during the SSE stream, so clients can render structured tool UI in real time.
 
 ### POST /v1/responses

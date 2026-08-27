@@ -404,7 +404,14 @@ async def test_contracted_stream_releases_valid_text_and_tool_lifecycle(surface,
 
     async with TestClient(TestServer(_app(adapter))) as client:
         with patch.object(adapter, "_run_agent", side_effect=run):
-            response = await client.post(path, json=_payload(surface, stream=True))
+            # Chat-completions lifecycle events are opt-in (strict OpenAI
+            # stream by default); the Responses surface emits spec-native
+            # function_call items unconditionally and ignores the header.
+            response = await client.post(
+                path,
+                json=_payload(surface, stream=True),
+                headers={"X-Hermes-Tool-Progress": "1"},
+            )
             body = await response.text()
 
     assert response.status == 200
