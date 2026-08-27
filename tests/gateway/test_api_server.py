@@ -1124,7 +1124,7 @@ class TestChatCompletionsEndpoint:
 
     @pytest.mark.asyncio
     async def test_stream_includes_tool_progress(self, adapter):
-        """tool_start_callback fires → progress appears as custom SSE event, not in delta.content."""
+        """Opted-in tool_start_callback fires → progress appears as custom SSE event, not in delta.content."""
         import asyncio
 
         app = _create_app(adapter)
@@ -1151,6 +1151,7 @@ class TestChatCompletionsEndpoint:
                         "messages": [{"role": "user", "content": "list files"}],
                         "stream": True,
                     },
+                    headers={"X-Hermes-Tool-Progress": "1"},
                 )
                 assert resp.status == 200
                 body = await resp.text()
@@ -1228,6 +1229,9 @@ class TestChatCompletionsEndpoint:
                         "model": "test",
                         "messages": [{"role": "user", "content": "list"}],
                         "stream": True,
+                        # Opt in via the body flag so this path is covered
+                        # alongside the header path exercised elsewhere.
+                        "tool_progress_events": True,
                     },
                 )
                 assert resp.status == 200
@@ -1297,6 +1301,7 @@ class TestChatCompletionsEndpoint:
                         "messages": [{"role": "user", "content": "ok"}],
                         "stream": True,
                     },
+                    headers={"X-Hermes-Tool-Progress": "1"},
                 )
                 assert resp.status == 200
                 body = await resp.text()
@@ -1307,6 +1312,75 @@ class TestChatCompletionsEndpoint:
             assert "call_orphan_1" not in body
             assert '"status": "running"' not in body
             assert '"status": "completed"' not in body
+
+    @pytest.mark.asyncio
+    async def test_stream_default_is_strict_openai(self, adapter):
+        """Without the opt-in, a tool-using turn stays strictly OpenAI-shaped.
+
+        Strict OpenAI-compatible SSE parsers (Vercel AI SDK and clients
+        built on it, e.g. n8n's LLM chat) JSON-decode every ``data:``
+        line as a ``chat.completion.chunk`` and ignore the ``event:``
+        name, so a ``hermes.tool.progress`` frame — whose payload has no
+        ``choices`` array — fails their schema validation and kills the
+        turn.  By default the gateway must therefore withhold the tool
+        lifecycle callbacks entirely: no ``event:`` lines, and every
+        ``data:`` payload except ``[DONE]`` carries a ``choices`` list.
+        """
+        import asyncio
+        import json as _json
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            seen_callbacks = {}
+
+            async def _mock_run_agent(**kwargs):
+                cb = kwargs.get("stream_delta_callback")
+                seen_callbacks["start"] = kwargs.get("tool_start_callback")
+                seen_callbacks["complete"] = kwargs.get("tool_complete_callback")
+                # Mirror run_agent: fire the lifecycle callbacks only when
+                # the gateway wired them.
+                ts_cb = seen_callbacks["start"]
+                tc_cb = seen_callbacks["complete"]
+                if ts_cb:
+                    ts_cb("call_terminal_1", "terminal", {"command": "ls -la"})
+                if tc_cb:
+                    tc_cb("call_terminal_1", "terminal", {"command": "ls -la"}, "ok")
+                if cb:
+                    await asyncio.sleep(0.05)
+                    cb("done.")
+                return (
+                    {"final_response": "done.", "messages": [], "api_calls": 1},
+                    {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+                )
+
+            with patch.object(adapter, "_run_agent", side_effect=_mock_run_agent):
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    json={
+                        "model": "test",
+                        "messages": [{"role": "user", "content": "list"}],
+                        "stream": True,
+                    },
+                )
+                assert resp.status == 200
+                body = await resp.text()
+
+            # The gateway must not have wired the lifecycle callbacks at all.
+            assert seen_callbacks["start"] is None
+            assert seen_callbacks["complete"] is None
+
+            # No custom SSE events, and every data frame is a valid
+            # chat.completion.chunk (i.e. has a ``choices`` list) or [DONE].
+            assert "event:" not in body
+            assert "hermes.tool.progress" not in body
+            for line in body.splitlines():
+                if not line.startswith("data: "):
+                    continue
+                if line.strip() == "data: [DONE]":
+                    continue
+                chunk = _json.loads(line[len("data: "):])
+                assert isinstance(chunk.get("choices"), list), chunk
+            assert "done." in body
 
 
 # ---------------------------------------------------------------------------
