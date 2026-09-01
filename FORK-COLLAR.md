@@ -36,6 +36,31 @@ git range-diff OLD_BASE..OLD_TIP upstream/main..HEAD
 git diff --check upstream/main...HEAD
 ```
 
+### macOS case-only contributor paths
+
+Upstream currently tracks both of these paths:
+
+```text
+contributors/emails/agent@Agents-Mac-mini.local
+contributors/emails/agent@agents-Mac-mini.local
+```
+
+A default case-insensitive macOS filesystem cannot materialize both entries,
+so the lowercase path may appear modified after rebasing even when the index is
+correct. Do not commit that false worktree change. Hide only that path locally:
+
+```bash
+git update-index --assume-unchanged \
+  contributors/emails/agent@agents-Mac-mini.local
+```
+
+Remove the local flag before diagnosing the path on a case-sensitive checkout:
+
+```bash
+git update-index --no-assume-unchanged \
+  contributors/emails/agent@agents-Mac-mini.local
+```
+
 ## Bounded verification
 
 Never run the repository-wide pytest suite locally. Count and then run the
