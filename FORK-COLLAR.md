@@ -80,9 +80,12 @@ git push fork HEAD:main
 Never force-push `main`. If it is not a fast-forward, stop and reconcile the
 fork state explicitly. Never create an upstream pull request.
 
-That push runs `.github/workflows/fork-collar-image.yml` in
-`joshuafielden43/hermes-agent`. The workflow builds Linux amd64 from the
-candidate commit and publishes two GHCR tags:
+The dated branch is only a rollback reference. Fast-forwarding fork `main`
+runs `.github/workflows/fork-collar-image.yml` in
+`joshuafielden43/hermes-agent`. Restricting the trigger to `main` prevents two
+builds of the same SHA from racing to overwrite the provenance manifest. The
+workflow builds Linux amd64 from the candidate commit and publishes two GHCR
+tags:
 
 ```text
 ghcr.io/joshuafielden43/hermes-agent:collar-latest
