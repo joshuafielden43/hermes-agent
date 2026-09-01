@@ -4,6 +4,7 @@ on:
   workflow_dispatch:
   push:
     branches:
+      - main
       - codex/api-response-contract-reconcile-*
 
 permissions:
@@ -53,4 +54,3 @@ jobs:
             HERMES_GIT_SHA=${{ github.sha }}
           cache-from: type=gha,scope=fork-collar-amd64
           cache-to: type=gha,mode=max,scope=fork-collar-amd64
-
