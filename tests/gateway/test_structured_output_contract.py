@@ -247,6 +247,38 @@ async def test_nonstream_repairs_once_and_commits_canonical(surface, path):
 
 
 @pytest.mark.asyncio
+async def test_structured_repair_preserves_declared_conversation_binding():
+    adapter = _adapter()
+    agent = MagicMock()
+    agent._persist_disabled = True
+
+    async def run(**kwargs):
+        assert kwargs["bind_declared_conversation"] is True
+        if kwargs.get("format_only"):
+            return _result('{"answer": 42}'), _usage()
+        kwargs["agent_ref"][0] = agent
+        return _result("not json"), _usage()
+
+    contract = _structured_output_contract(
+        {"type": "json_object"}, responses=True
+    )
+    with patch.object(adapter, "_run_agent", side_effect=run) as run_mock:
+        result, _ = await adapter._run_agent_with_structured_output_repair(
+            user_message="answer",
+            conversation_history=[],
+            ephemeral_system_prompt=None,
+            session_id="session-1",
+            gateway_session_key="conversation-1",
+            route=None,
+            output_contract=contract,
+            bind_declared_conversation=True,
+        )
+
+    assert run_mock.call_count == 2
+    assert result["final_response"] == '{"answer": 42}'
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(("surface", "path"), (
     ("chat", "/v1/chat/completions"),
     ("responses", "/v1/responses"),

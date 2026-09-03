@@ -7984,6 +7984,7 @@ class APIServerAdapter(BasePlatformAdapter):
         requested_model: Optional[str] = None,
         requested_provider: Optional[str] = None,
         model_options: Optional[Dict[str, Any]] = None,
+        bind_declared_conversation: bool = False,
     ) -> tuple:
         """Run once, then make one contract-preserving repair turn if needed.
 
@@ -8003,6 +8004,7 @@ class APIServerAdapter(BasePlatformAdapter):
             requested_model=requested_model,
             requested_provider=requested_provider,
             model_options=model_options,
+            bind_declared_conversation=bind_declared_conversation,
             output_contract=output_contract,
             agent_ref=initial_agent_ref,
             defer_persistence=bool(output_contract),
@@ -8046,6 +8048,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 requested_model=requested_model,
                 requested_provider=requested_provider,
                 model_options=model_options,
+                bind_declared_conversation=bind_declared_conversation,
                 output_contract=output_contract,
                 format_only=True,
             )
