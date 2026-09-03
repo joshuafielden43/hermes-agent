@@ -2,8 +2,8 @@
 
 Date: 2026-09-03. Task: Vikunja 2089, under 2082.
 
-Status: CI is the first implementation slice. The publishing-hook decisions
-below are approved direction, not a claim that hooks are already installed.
+Status: CI is live. The tracked publisher and installer are implemented;
+installation and real automatic-publication verification follow review.
 
 ## Decision and implementation order
 
@@ -38,6 +38,10 @@ below are approved direction, not a claim that hooks are already installed.
 The post-commit hook cannot roll back a commit; a queue/push failure is reported,
 not hidden as commit failure. The worker is detached, not a durable scheduler:
 machine shutdown may interrupt it. Status and retry are explicit commands.
+Retry accepts failed receipts only; interrupted nonterminal jobs require checking
+that the worker is gone and explicitly queuing the desired attached HEAD again.
+Rapid commits can race: an older non-fast-forward push records failure rather
+than forcing history or silently substituting a newer commit.
 
 Hooks do not magically follow clones. Each checkout must run the tracked
 installer. Local hooks cannot stop deliberate `--no-verify`, changing Git
@@ -57,3 +61,30 @@ the entire upstream repository. On 2026-09-03 that command passed Ruff, focused
 type checks, and 498 tests with one skip. Separate Standards and Spec reviews
 reported zero findings for this CI slice. Hosted execution is verified after
 pushing the exact commit; local success alone is not a hosted CI receipt.
+
+## Publishing commands
+
+Run from the intended worktree, after committing the publisher source:
+
+```sh
+python3 scripts/fork_publish.py install
+python3 scripts/fork_publish.py status
+python3 scripts/fork_publish.py retry /absolute/path/to/receipt.json
+# Explicitly queue HEAD after a history operation or initial installation:
+python3 scripts/fork_publish.py queue
+```
+
+Installation generates executable hook entry points from the tracked installer
+and snapshots the committed publisher under this worktree's private Git directory.
+Each commit gets another immutable worker snapshot and a JSON receipt plus log.
+Reinstall after changing the installer/queue/guard to update the installed hooks.
+The worker uses Git and an authenticated `gh` on PATH, with noninteractive SSH;
+it does not copy credentials into the repository. Its Python interpreter must
+remain available. A successful push becomes `watching`, not `passed`, until
+two consecutive checks see the same all-successful exact-SHA workflow set,
+including Fork CI. The coverage cap is 100 runs and the deadline is 30 minutes;
+both fail closed. Workflows triggered later are outside this bounded observation.
+
+No hook is removed from an existing hook chain: installation refuses unrelated
+active hooks. `origin` and `upstream` receive disabled push URLs only in this
+worktree, and the pre-push hook also rejects direct URLs and other remote names.
