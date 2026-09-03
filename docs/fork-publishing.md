@@ -2,8 +2,10 @@
 
 Date: 2026-09-03. Task: Vikunja 2089, under 2082.
 
-Status: CI is live. The tracked publisher and installer are implemented;
-installation and real automatic-publication verification follow review.
+Status: CI is live. The tracked publisher and installer are implemented and
+installed in the reconciliation worktree on 2026-09-03. Other worktrees are
+unchanged. This installation-record commit exercises live automatic publication;
+its exact-SHA receipt and hosted CI result are recorded in task 2089.
 
 ## Decision and implementation order
 
@@ -50,6 +52,8 @@ writes. Stronger prevention needs scoped credentials/server authorization.
 
 No existing quality or secret hook is removed. Installing into a checkout with
 unrelated active hooks stops for integration rather than silently replacing it.
+Reinstallation also verifies the installed directory's content hashes; added or
+modified hooks require explicit integration, including changes to owned entries.
 The publisher does not auto-stage files, create commits, wake inactive agents,
 or send credentials to CI. Publishing is not deployment or production approval.
 
@@ -84,7 +88,24 @@ remain available. A successful push becomes `watching`, not `passed`, until
 two consecutive checks see the same all-successful exact-SHA workflow set,
 including Fork CI. The coverage cap is 100 runs and the deadline is 30 minutes;
 both fail closed. Workflows triggered later are outside this bounded observation.
+Previously observed runs remain mandatory: disappearance fails closed rather
+than silently reducing the workflow set. Queue preparation failures also retain
+a failed receipt for retry of the original commit.
 
 No hook is removed from an existing hook chain: installation refuses unrelated
 active hooks. `origin` and `upstream` receive disabled push URLs only in this
 worktree, and the pre-push hook also rejects direct URLs and other remote names.
+
+## Installation verification
+
+Publisher implementation: `3c4d3a094c39` (2026-09-03). Local verification passed
+Ruff, focused type checks, and 524 tests with one skip across 11 modules,
+including 26 publisher contracts. Standards and Spec re-reviews reported zero
+unresolved findings after regression-tested corrections.
+
+The reconciliation worktree's `config.worktree` pins default/current-branch
+pushes to `fork`, disables origin/upstream push URLs, and selects the generated
+hooks. The sibling `hermes-agent-json-response-contract-local` checkout retained
+its original remote URLs and unset hooks path. A direct guard invocation with
+`origin` was rejected without contacting a remote. The next publication is the
+real post-commit proof, not a deployment or main-branch promotion.
