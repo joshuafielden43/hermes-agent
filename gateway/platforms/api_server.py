@@ -2460,6 +2460,8 @@ class APIServerAdapter(BasePlatformAdapter):
             ("POST", "/api/sessions/{session_id}/chat/stream", self._handle_session_chat_stream),
             ("POST", "/api/sessions/{session_id}/model", self._handle_session_model_lock),
             ("POST", "/v1/chat/completions", self._handle_chat_completions),
+            ("POST", "/v1/inference/chat/completions", self._handle_caller_inference),
+            ("GET", "/v1/inference/models", self._handle_caller_inference),
             ("POST", "/v1/responses", self._handle_responses),
             ("GET", "/v1/responses/{response_id}", self._handle_get_response),
             ("DELETE", "/v1/responses/{response_id}", self._handle_delete_response),
@@ -2483,6 +2485,22 @@ class APIServerAdapter(BasePlatformAdapter):
             # by a NAS-minted JWT (NOT API_SERVER_KEY).
             routes.append(("POST", "/api/cron/fire", self._handle_cron_fire))
         return routes
+
+    async def _handle_caller_inference(self, request):
+        """Stateless inference, deliberately separate from the agent handlers."""
+        from gateway.caller_inference import handle_inference
+
+        auth_error = self._check_auth(request)
+        if auth_error is not None:
+            return auth_error
+        # This endpoint never permits the default listener's no-key test mode.
+        if not self._expected_api_key():
+            return web.json_response({"error": {"code": "gateway_auth_failed"}}, status=401)
+        for refusal in (self._draining_response(), self._concurrency_limited_response()):
+            if refusal is not None:
+                return refusal
+        with _reserve_pending_api_work(self):
+            return await handle_inference(request)
 
     # ------------------------------------------------------------------
     # Session header helpers

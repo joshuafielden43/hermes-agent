@@ -3432,6 +3432,14 @@ DEFAULT_CONFIG = {
         # OpenAI-compatible API server platform
         # (gateway/platforms/api_server.py).
         "api_server": {
+            # Separate stateless inference; callers execute their own functions.
+            # Credentials are resolved from the named server-side provider.
+            "caller_inference": {
+                "enabled": False,
+                "provider": "",
+                "model": "",
+                "context_length": 0,
+            },
             # Maximum number of agent runs the API server will service
             # concurrently. Requests to /v1/chat/completions, /v1/responses,
             # and /v1/runs that arrive while this many runs are already
