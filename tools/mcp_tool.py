@@ -6172,16 +6172,25 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
                         )
                     _call_coro = server.session.call_tool(tool_name, arguments=args)
                     _watch_children = getattr(server, "_watch_stdio_children", None)
-                    _watch_ok = (
-                        _watch_children is not None
-                        and inspect.isawaitable(_watch_children())
-                        and asyncio.iscoroutine(_call_coro)
+                    # Create the watcher awaitable exactly once (#95938):
+                    # probing with _watch_children() here and calling it again
+                    # in the race branch leaks the probe coroutine
+                    # ("coroutine was never awaited"). callable() guard, same
+                    # as _stdio_dead above: MagicMock attributes are callable
+                    # but return non-awaitable Mocks.
+                    _watch_coro = (
+                        _watch_children() if callable(_watch_children) else None
                     )
+                    if _watch_coro is not None and not inspect.isawaitable(_watch_coro):
+                        _watch_coro = None
+                    _watch_ok = _watch_coro is not None and asyncio.iscoroutine(_call_coro)
                     if not _watch_ok:
                         # Stubbed sessions (MagicMock in tests) return a
                         # non-awaitable, or there is no child-watcher to race
                         # against: plain await is exactly the pre-#81995
                         # semantics.
+                        if _watch_coro is not None and asyncio.iscoroutine(_watch_coro):
+                            _watch_coro.close()
                         result = (
                             await _call_coro
                             if asyncio.iscoroutine(_call_coro)
@@ -6193,7 +6202,7 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
                         # the call immediately instead of riding out the full
                         # tool timeout.
                         rpc_task = asyncio.ensure_future(_call_coro)
-                        watch_task = asyncio.ensure_future(_watch_children())
+                        watch_task = asyncio.ensure_future(_watch_coro)
                         try:
                             done, _pending = await asyncio.wait(
                                 {rpc_task, watch_task},
