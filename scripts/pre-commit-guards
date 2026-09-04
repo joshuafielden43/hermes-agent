@@ -34,7 +34,18 @@
 set -u
 fail=0
 
-staged=$(git diff --cached --name-only --diff-filter=AM)
+# During a merge, upstream's tree is already a reviewed input. Scan the staged
+# result against MERGE_HEAD so the guard evaluates only our carried-forward
+# changes and conflict resolutions; comparing against HEAD would misclassify
+# every upstream test fixture as newly authored local content.
+merge_head=""
+if merge_head=$(git rev-parse -q --verify MERGE_HEAD 2>/dev/null); then
+  staged=$(comm -12 \
+    <(git diff --cached --name-only --diff-filter=AM HEAD | sort -u) \
+    <(git diff --cached --name-only --diff-filter=AM "$merge_head" | sort -u))
+else
+  staged=$(git diff --cached --name-only --diff-filter=AM)
+fi
 [ -z "$staged" ] && exit 0
 
 MAX_FILE_BYTES="${GUARD_MAX_FILE_BYTES:-5242880}"
@@ -97,15 +108,22 @@ while IFS= read -r f; do
   fi
 
   content=$(git show ":$f" 2>/dev/null)
+  if [ -n "$merge_head" ]; then
+    guard_content=$(comm -12 \
+      <(git diff --cached --unified=0 HEAD -- "$f" | sed -n '/^+++ /d; s/^+//p' | sort -u) \
+      <(git diff --cached --unified=0 "$merge_head" -- "$f" | sed -n '/^+++ /d; s/^+//p' | sort -u))
+  else
+    guard_content=$(git diff --cached --unified=0 -- "$f" | sed -n '/^+++ /d; s/^+//p')
+  fi
 
   # ---- secrets: content ----
   if guard_on secrets; then
-    if printf '%s' "$content" | grep -qE -- '-----BEGIN [A-Z ]*PRIVATE KEY-----'; then
+    if printf '%s' "$guard_content" | grep -qE -- '-----BEGIN [A-Z ]*PRIVATE KEY-----'; then
       # Allowlisted by the exact full LINE containing the marker (never the
       # marker alone — that would excuse every private key). Excuses only a
       # byte-identical fixture line, e.g. an inline dummy key in a scanner test.
       allowlist="${GUARD_SECRETS_ALLOWLIST:-.git/secret-allowlist}"
-      hits=$(printf '%s' "$content" | grep -E -- '-----BEGIN [A-Z ]*PRIVATE KEY-----')
+      hits=$(printf '%s' "$guard_content" | grep -E -- '-----BEGIN [A-Z ]*PRIVATE KEY-----')
       if [ -f "$allowlist" ]; then
         hits=$(printf '%s\n' "$hits" | grep -vxF -f "$allowlist")
       fi
@@ -115,9 +133,9 @@ while IFS= read -r f; do
         continue
       fi
     fi
-    if printf '%s' "$content" | grep -qE -- "$token_pattern"; then
+    if printf '%s' "$guard_content" | grep -qE -- "$token_pattern"; then
       allowlist="${GUARD_SECRETS_ALLOWLIST:-.git/secret-allowlist}"
-      hits=$(printf '%s' "$content" | grep -oE -- "$token_pattern" | sort -u)
+      hits=$(printf '%s' "$guard_content" | grep -oE -- "$token_pattern" | sort -u)
       if [ -f "$allowlist" ]; then
         hits=$(printf '%s\n' "$hits" | grep -vxF -f "$allowlist")
       fi
@@ -132,7 +150,7 @@ while IFS= read -r f; do
 
   # ---- conflict markers ----
   if guard_on conflicts; then
-    if printf '%s' "$content" | grep -qE -- '^(<<<<<<< |>>>>>>> )'; then
+    if printf '%s' "$guard_content" | grep -qE -- '^(<<<<<<< |>>>>>>> )'; then
       printf '  \342\234\213 %s  (unresolved merge-conflict marker)\n' "$f" >&2
       fail=1
       continue
