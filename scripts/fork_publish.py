@@ -26,7 +26,7 @@ def load_policy():
         if path.resolve().parent.parent.name == "fork-publish":
             raise ValueError("Installed policy snapshot missing; publication blocked")
         path = Path(git("rev-parse", "--show-toplevel")) / ".git-publishing.json"
-    policy = json.loads(path.read_text())
+    policy = json.loads(path.read_text(encoding="utf-8"))
     if (
         not isinstance(policy, dict)
         or not re.fullmatch(
@@ -85,12 +85,14 @@ def snapshot(sha, path=None):
     source = Path(__file__).read_text(encoding="utf-8")
     if path is None:
         path = Path(tempfile.mkdtemp(prefix=f"{sha[:12]}-", dir=state_directory()))
-    (path / "fork_publish.py").write_text(source)
-    (path / "publishing-policy.json").write_text(json.dumps(POLICY))
+    (path / "fork_publish.py").write_text(source, encoding="utf-8")
+    (path / "publishing-policy.json").write_text(
+        json.dumps(POLICY), encoding="utf-8"
+    )
     launch = f"exec {shlex.quote(sys.executable)} {shlex.quote(str(path / 'fork_publish.py'))}"
     for name, action in (("post-commit", "queue"), ("pre-push", "guard")):
         hook = path / name
-        hook.write_text(f'#!/bin/sh\n{launch} {action} "$@"\n')
+        hook.write_text(f'#!/bin/sh\n{launch} {action} "$@"\n', encoding="utf-8")
         hook.chmod(0o700)
     return path
 
@@ -193,7 +195,7 @@ def install():
 
 def save(path, receipt):
     temporary = path.with_suffix(f".{os.getpid()}.tmp")
-    temporary.write_text(json.dumps(receipt, indent=2) + "\n")
+    temporary.write_text(json.dumps(receipt, indent=2) + "\n", encoding="utf-8")
     temporary.chmod(0o600)
     temporary.replace(path)
 
@@ -287,7 +289,7 @@ def queue():
 def retry(path):
     if path.parent.parent != state_directory().resolve() or path.name != "receipt.json":
         raise ValueError("Retry requires a receipt belonging to this worktree")
-    receipt = json.loads(path.read_text())
+    receipt = json.loads(path.read_text(encoding="utf-8"))
     if receipt["state"] != "failed":
         raise ValueError("Only failed jobs can be retried")
     receipt.pop("error", None)
@@ -331,7 +333,7 @@ def spawn_worker(path, receipt, prepare=True):
 
 
 def work(path):
-    receipt = json.loads(path.read_text())
+    receipt = json.loads(path.read_text(encoding="utf-8"))
     sha, ref = receipt["sha"], receipt["ref"]
     try:
         if (
@@ -499,7 +501,7 @@ def main():
         retry(Path(sys.argv[2]).resolve())
     elif sys.argv[1] == "status":
         receipts = [
-            json.loads(path.read_text())
+            json.loads(path.read_text(encoding="utf-8"))
             for path in state_directory().glob("*/receipt.json")
         ]
         print(

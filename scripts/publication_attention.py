@@ -4,11 +4,28 @@
 import hashlib
 import json
 import os
+import ctypes
 from pathlib import Path
 import re
 import subprocess
 import sys
 import time
+
+
+def pid_exists(pid):
+    if sys.platform == "win32":
+        process = ctypes.windll.kernel32.OpenProcess(0x1000, False, pid)
+        if not process:
+            return False
+        ctypes.windll.kernel32.CloseHandle(process)
+        return True
+    try:
+        os.kill(pid, 0)  # windows-footgun: ok -- unreachable on Windows
+        return True
+    except PermissionError:
+        return True
+    except ProcessLookupError:
+        return False
 
 
 def main():
@@ -28,7 +45,7 @@ def main():
     notices = []
     for path in sorted(directory.glob("*/receipt.json")):
         try:
-            receipt = json.loads(path.read_text())
+            receipt = json.loads(path.read_text(encoding="utf-8"))
             state, sha = receipt["state"], receipt["sha"]
             if not re.fullmatch(r"[a-f0-9]{40,64}", sha):
                 raise ValueError("invalid SHA")
@@ -39,13 +56,7 @@ def main():
                 alive = False
                 pid = receipt.get("pid")
                 if type(pid) is int and pid > 0:
-                    try:
-                        os.kill(pid, 0)
-                        alive = True
-                    except PermissionError:
-                        alive = True
-                    except ProcessLookupError:
-                        pass
+                    alive = pid_exists(pid)
                 if age < 60 or (alive and age < 2100):
                     continue
                 state = "interrupted or overdue"
@@ -61,7 +72,7 @@ def main():
     key = hashlib.sha256((session + json.dumps(notices)).encode()).hexdigest()
     seen_path = directory / "attention-seen.json"
     try:
-        seen = json.loads(seen_path.read_text())
+        seen = json.loads(seen_path.read_text(encoding="utf-8"))
         if not isinstance(seen, list):
             seen = []
     except (OSError, ValueError):
@@ -82,7 +93,7 @@ def main():
     )
     if session:
         temporary = directory / f"attention-seen.{os.getpid()}.tmp"
-        temporary.write_text(json.dumps((seen + [key])[-100:]))
+        temporary.write_text(json.dumps((seen + [key])[-100:]), encoding="utf-8")
         temporary.chmod(0o600)
         temporary.replace(seen_path)
 
