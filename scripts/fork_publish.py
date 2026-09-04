@@ -86,9 +86,7 @@ def snapshot(sha, path=None):
     if path is None:
         path = Path(tempfile.mkdtemp(prefix=f"{sha[:12]}-", dir=state_directory()))
     (path / "fork_publish.py").write_text(source, encoding="utf-8")
-    (path / "publishing-policy.json").write_text(
-        json.dumps(POLICY), encoding="utf-8"
-    )
+    (path / "publishing-policy.json").write_text(json.dumps(POLICY), encoding="utf-8")
     launch = f"exec {shlex.quote(sys.executable)} {shlex.quote(str(path / 'fork_publish.py'))}"
     for name, action in (("post-commit", "queue"), ("pre-push", "guard")):
         hook = path / name
