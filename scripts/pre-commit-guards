@@ -1,0 +1,215 @@
+#!/usr/bin/env bash
+#
+# pre-commit-guards — composable commit-time guardrails.
+#
+# One self-contained hook running several independent checks against the staged
+# changeset. Self-contained on purpose: in a non-Husky repo this file is copied
+# alone into .git/hooks/, with no sibling scripts to source — so every guard
+# lives here as a function.
+#
+# Guards:
+#   • secrets          — secret-shaped filenames + content sweep for private-key
+#                        blocks and common leaked-token shapes. Templates get
+#                        filename exemptions only, never content exemptions.
+#   • conflict markers — unresolved <<<<<<< / >>>>>>> merge markers.
+#   • large files      — blobs over GUARD_MAX_FILE_BYTES (default 5 MiB).
+#   • python quality   — staged *.py are ruff-clean (format + lint). Self-
+#                        activates only when ruff is installed AND *.py is
+#                        staged; otherwise a no-op. WARNS by default (commit
+#                        proceeds, CI still enforces); GUARD_PYTHON_BLOCK=1
+#                        makes it block instead.
+#
+# Config (env):
+#   GUARD_MAX_FILE_BYTES   size ceiling in bytes (default 5242880 = 5 MiB)
+#   GUARD_PYTHON_BLOCK     if set, ruff findings block the commit (default: warn only)
+#   GUARD_DISABLE          space/comma list of guards to skip: secrets conflicts large python
+#   GUARD_SECRETS_ALLOWLIST  path to a file of exact, known-safe literals
+#                        (default: .git/secret-allowlist). A content hit is
+#                        excused only when it is byte-for-byte identical to a
+#                        listed line (grep -vxF). Add the full matched string,
+#                        never a substring or pattern — an allowlisted entry
+#                        can only ever excuse that one exact artifact.
+# Maintained as a reusable default in: claude-config/git-hardening/
+#
+set -u
+fail=0
+
+# During a merge, upstream's tree is already a reviewed input. Scan the staged
+# result against MERGE_HEAD so the guard evaluates only our carried-forward
+# changes and conflict resolutions; comparing against HEAD would misclassify
+# every upstream test fixture as newly authored local content.
+merge_head=""
+if merge_head=$(git rev-parse -q --verify MERGE_HEAD 2>/dev/null); then
+  staged=$(comm -12 \
+    <(git diff --cached --name-only --diff-filter=AM HEAD | sort -u) \
+    <(git diff --cached --name-only --diff-filter=AM "$merge_head" | sort -u))
+else
+  staged=$(git diff --cached --name-only --diff-filter=AM)
+fi
+[ -z "$staged" ] && exit 0
+
+MAX_FILE_BYTES="${GUARD_MAX_FILE_BYTES:-5242880}"
+DISABLE=" ${GUARD_DISABLE:-} "
+py_files=()   # staged *.py, collected for the ruff guard after the per-file loop
+
+guard_on() {
+  case "$DISABLE" in
+    *" $1 "*|*",$1,"*|*" $1,"*|*",$1 "*) return 1 ;;
+    *) return 0 ;;
+  esac
+}
+
+is_template() {
+  case "$1" in
+    *.example|*.sample|*.template|*.dist|*.defaults|*.default|*.tpl) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# common leaked-token shapes, checked against staged content of every file below
+token_pattern='AKIA[0-9A-Z]{16}|gh[pousr]_[A-Za-z0-9]{36,}|github_pat_[A-Za-z0-9_]{20,}|xox[baprs]-[A-Za-z0-9-]{10,}|(^|[^A-Za-z0-9_-])sk-(ant-)?[A-Za-z0-9_-]{20,}|AIza[0-9A-Za-z_-]{35}|eyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}'
+
+human_size() {
+  # bytes -> short human string, integer math only
+  b=$1
+  if [ "$b" -ge 1048576 ]; then echo "$(( b / 1048576 )) MiB"
+  elif [ "$b" -ge 1024 ]; then echo "$(( b / 1024 )) KiB"
+  else echo "${b} B"; fi
+}
+
+while IFS= read -r f; do
+  [ -z "$f" ] && continue
+  base=$(basename "$f")
+  case "$f" in *.py) py_files+=("$f") ;; esac
+  size=$(git cat-file -s ":$f" 2>/dev/null || echo 0)
+
+  # ---- large files ---- (applies to every staged blob, binary included)
+  if guard_on large && [ "$size" -gt "$MAX_FILE_BYTES" ]; then
+    printf '  \342\234\213 %s  (%s > limit %s)\n' \
+      "$f" "$(human_size "$size")" "$(human_size "$MAX_FILE_BYTES")" >&2
+    fail=1
+    continue
+  fi
+
+  # ---- secrets: filename ----
+  if guard_on secrets && ! is_template "$base"; then
+    hit=""
+    case "$base" in
+      .env|.env.*|*.env)                          hit="env file" ;;
+      auth.json|*.secret|*secrets.json|*secrets.yaml|*secrets.yml) hit="secret store" ;;
+      id_rsa|id_dsa|id_ecdsa|id_ed25519|*.pem|*.key|*.p12|*.pfx|*.keystore|*.jks) hit="private key / cert" ;;
+      .netrc|.htpasswd|.pgpass|credentials|credentials.*) hit="credentials file" ;;
+    esac
+    if [ -n "$hit" ]; then
+      printf '  \342\234\213 %s  (%s)\n' "$f" "$hit" >&2
+      fail=1
+      continue
+    fi
+  fi
+
+  content=$(git show ":$f" 2>/dev/null)
+  if [ -n "$merge_head" ]; then
+    guard_content=$(comm -12 \
+      <(git diff --cached --unified=0 HEAD -- "$f" | sed -n '/^+++ /d; s/^+//p' | sort -u) \
+      <(git diff --cached --unified=0 "$merge_head" -- "$f" | sed -n '/^+++ /d; s/^+//p' | sort -u))
+  else
+    guard_content=$(git diff --cached --unified=0 -- "$f" | sed -n '/^+++ /d; s/^+//p')
+  fi
+
+  # ---- secrets: content ----
+  if guard_on secrets; then
+    if printf '%s' "$guard_content" | grep -qE -- '-----BEGIN [A-Z ]*PRIVATE KEY-----'; then
+      # Allowlisted by the exact full LINE containing the marker (never the
+      # marker alone — that would excuse every private key). Excuses only a
+      # byte-identical fixture line, e.g. an inline dummy key in a scanner test.
+      allowlist="${GUARD_SECRETS_ALLOWLIST:-.git/secret-allowlist}"
+      hits=$(printf '%s' "$guard_content" | grep -E -- '-----BEGIN [A-Z ]*PRIVATE KEY-----')
+      if [ -f "$allowlist" ]; then
+        hits=$(printf '%s\n' "$hits" | grep -vxF -f "$allowlist")
+      fi
+      if [ -n "$hits" ]; then
+        printf '  \342\234\213 %s  (contains a PRIVATE KEY block)\n' "$f" >&2
+        fail=1
+        continue
+      fi
+    fi
+    if printf '%s' "$guard_content" | grep -qE -- "$token_pattern"; then
+      allowlist="${GUARD_SECRETS_ALLOWLIST:-.git/secret-allowlist}"
+      hits=$(printf '%s' "$guard_content" | grep -oE -- "$token_pattern" | sort -u)
+      if [ -f "$allowlist" ]; then
+        hits=$(printf '%s\n' "$hits" | grep -vxF -f "$allowlist")
+      fi
+      if [ -n "$hits" ]; then
+        printf '  \342\234\213 %s  (contains what looks like a live API token)\n' "$f" >&2
+        echo '      credential-like value redacted' >&2
+        fail=1
+        continue
+      fi
+    fi
+  fi
+
+  # ---- conflict markers ----
+  if guard_on conflicts; then
+    if printf '%s' "$guard_content" | grep -qE -- '^(<<<<<<< |>>>>>>> )'; then
+      printf '  \342\234\213 %s  (unresolved merge-conflict marker)\n' "$f" >&2
+      fail=1
+      continue
+    fi
+  fi
+done <<EOF
+$staged
+EOF
+
+# ---- python quality (ruff) ----
+# Runs once over all staged *.py. Inert unless ruff is on PATH and *.py is
+# staged. ruff reads the working-tree files with config auto-discovered from
+# the repo root (the hook's CWD).
+# Do not run diagnostic tools after a hard guard failure: they may quote the
+# rejected source line and leak the very credential we just redacted.
+if [ "$fail" -eq 0 ] && guard_on python && [ "${#py_files[@]}" -gt 0 ] && command -v ruff >/dev/null 2>&1; then
+  py_msg=""
+  if ! out=$(ruff format --check -- "${py_files[@]}" 2>&1); then
+    py_msg="${py_msg}${out}"$'\n'
+  fi
+  if ! out=$(ruff check -- "${py_files[@]}" 2>&1); then
+    py_msg="${py_msg}${out}"$'\n'
+  fi
+  if [ -n "$py_msg" ]; then
+    if [ -n "${GUARD_PYTHON_BLOCK:-}" ]; then
+      printf '  \342\234\213 staged Python is not ruff-clean:\n' >&2
+      printf '%s' "$py_msg" | sed 's/^/    /' >&2
+      fail=1
+    else
+      {
+        echo ""
+        printf '  \342\232\240 staged Python is not ruff-clean (warning only — commit proceeds):\n'
+        printf '%s' "$py_msg" | sed 's/^/    /'
+        echo "    fix: ruff format . && ruff check --fix .   (CI enforces; GUARD_DISABLE=python silences)"
+      } >&2
+    fi
+  fi
+fi
+
+if [ "$fail" -ne 0 ]; then
+  {
+    echo ""
+    echo "  COMMIT BLOCKED — staged changes tripped a git-hardening guard."
+    echo "  Nothing was committed. Depending on what fired:"
+    echo "    • secret       → add the path to .gitignore, or move it to an"
+    echo "                     ignored path / /Volumes/Secrets; templates take"
+    echo "                     a .example/.sample suffix."
+    echo "    • conflict     → finish resolving the merge; remove the markers."
+    echo "    • large file   → keep big artifacts out of git (LFS, an ignored"
+    echo "                     path, or a release asset); raise the ceiling with"
+    echo "                     GUARD_MAX_FILE_BYTES if it's genuinely intended."
+    echo "    • python       → ruff format . && ruff check --fix .  (only blocks"
+    echo "                     when GUARD_PYTHON_BLOCK is set; unset it to warn)."
+    echo "    • false alarm  → add the exact matched string (full line,"
+    echo "                     byte-for-byte) to .git/secret-allowlist — never"
+    echo "                     a substring or pattern."
+    echo "  Guard: $0  (claude-config/git-hardening)"
+    echo ""
+  } >&2
+  exit 1
+fi
+exit 0

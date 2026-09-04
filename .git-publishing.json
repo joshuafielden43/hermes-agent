@@ -1,0 +1,13 @@
+{
+  "repository": "joshuafielden43/hermes-agent",
+  "remote": "fork",
+  "workflow": "Fork CI",
+  "protected_branches": ["main"],
+  "trusted_history": [
+    {
+      "remote": "upstream",
+      "url": "https://github.com/NousResearch/hermes-agent.git",
+      "ref": "refs/remotes/upstream/main"
+    }
+  ]
+}
