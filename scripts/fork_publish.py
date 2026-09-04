@@ -413,6 +413,31 @@ def scan_outgoing(sha, previous):
     Report object IDs only, never matched values or credential-bearing lines.
     """
     revisions = [sha] + ([f"^{previous}"] if previous.strip("0") else [])
+    for trusted in POLICY.get("trusted_history", []):
+        if not isinstance(trusted, dict) or set(trusted) != {"remote", "url", "ref"}:
+            raise ValueError("Malformed trusted-history policy; publication blocked")
+        remote, url, ref = trusted["remote"], trusted["url"], trusted["ref"]
+        if (
+            not isinstance(remote, str)
+            or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", remote)
+            or not isinstance(url, str)
+            or not url
+            or ref != f"refs/remotes/{remote}/main"
+            or git("remote", "get-url", "--all", remote).splitlines() != [url]
+        ):
+            raise ValueError("Trusted-history remote does not match pinned policy")
+        trusted_sha = git("rev-parse", "--verify", f"{ref}^{{commit}}")
+        # A trusted ref may advance independently; exclude it only when its
+        # exact local tip is actually contained in the outgoing history.
+        contained = subprocess.run(
+            ["git", "merge-base", "--is-ancestor", trusted_sha, sha],
+            capture_output=True,
+            timeout=30,
+        )
+        if contained.returncode == 0:
+            revisions.append(f"^{trusted_sha}")
+        elif contained.returncode != 1:
+            raise ValueError("Unable to validate trusted history")
     objects = git("rev-list", "--objects", "--no-object-names", *revisions).splitlines()
     if len(objects) > 20000:
         raise ValueError("Outgoing scan coverage limit reached; publication blocked")

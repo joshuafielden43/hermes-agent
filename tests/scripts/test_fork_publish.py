@@ -48,6 +48,10 @@ def repo(tmp_path, monkeypatch):
         PUBLISHER.parents[1] / ".git-publishing.json", tmp_path / ".git-publishing.json"
     )
     run(tmp_path, "git", "commit", "--allow-empty", "-m", "initial")
+    policy = json.loads((tmp_path / ".git-publishing.json").read_text())
+    for trusted in policy.get("trusted_history", []):
+        run(tmp_path, "git", "remote", "add", trusted["remote"], trusted["url"])
+        run(tmp_path, "git", "update-ref", trusted["ref"], "HEAD")
     return tmp_path
 
 
@@ -88,14 +92,15 @@ def test_installer_scopes_hooks_and_destinations_to_this_worktree(repo, tmp_path
     other = tmp_path / "sibling"
     run(repo, "git", "worktree", "add", "-b", "codex/other", str(other))
     run(repo, "git", "remote", "add", "source", "ssh://lab.invalid/source")
-    run(
-        repo,
-        "git",
-        "remote",
-        "add",
-        "upstream",
-        "https://github.com/NousResearch/hermes-agent.git",
-    )
+    if run(repo, "git", "remote", "get-url", "upstream", check=False).returncode:
+        run(
+            repo,
+            "git",
+            "remote",
+            "add",
+            "upstream",
+            "https://github.com/NousResearch/hermes-agent.git",
+        )
     result = run(repo, sys.executable, str(PUBLISHER), "install", check=False)
     assert result.returncode == 0, result.stderr
     assert (
