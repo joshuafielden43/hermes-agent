@@ -470,11 +470,14 @@ def scan_outgoing(sha, previous):
         token_hit = any(
             match.group() not in allowed for match in tokens.finditer(result.stdout)
         )
-        key_hit = any(
-            keys.search(line)
-            and (line not in allowed or line.strip() == keys.search(line).group())
-            for line in result.stdout.splitlines()
-        )
+        key_hit = False
+        for line in result.stdout.splitlines():
+            match = keys.search(line)
+            if match is not None and (
+                line not in allowed or line.strip() == match.group()
+            ):
+                key_hit = True
+                break
         if token_hit or key_hit:
             raise ValueError(
                 f"Outgoing credential-like content in object {oid}; value redacted"
