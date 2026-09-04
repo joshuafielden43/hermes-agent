@@ -73,14 +73,12 @@ def main():
         context += f"\n{len(notices) - 20} more unresolved receipts."
     context += "\nInspect Git-local fork-publish receipts before reporting publication clean. Do not automatically retry or change history."
     print(
-        json.dumps(
-            {
-                "hookSpecificOutput": {
-                    "hookEventName": "SessionStart",
-                    "additionalContext": context,
-                }
+        json.dumps({
+            "hookSpecificOutput": {
+                "hookEventName": "SessionStart",
+                "additionalContext": context,
             }
-        )
+        })
     )
     if session:
         temporary = directory / f"attention-seen.{os.getpid()}.tmp"
@@ -95,12 +93,10 @@ if __name__ == "__main__":
     except Exception:
         # No raw exceptions: hook input or receipt errors may contain secrets.
         print(
-            json.dumps(
-                {
-                    "hookSpecificOutput": {
-                        "hookEventName": "SessionStart",
-                        "additionalContext": "Publication attention check could not complete; inspect local receipts manually.",
-                    }
+            json.dumps({
+                "hookSpecificOutput": {
+                    "hookEventName": "SessionStart",
+                    "additionalContext": "Publication attention check could not complete; inspect local receipts manually.",
                 }
-            )
+            })
         )

@@ -550,9 +550,11 @@ def test_session_attention_reports_interrupted_worker(repo):
     state = repo / ".git/fork-publish/job"
     state.mkdir(parents=True)
     (state / "receipt.json").write_text(
-        json.dumps(
-            {"sha": "b" * 40, "state": "watching", "created": time.time() - 4000}
-        )
+        json.dumps({
+            "sha": "b" * 40,
+            "state": "watching",
+            "created": time.time() - 4000,
+        })
     )
     script = str(PUBLISHER.parent / "publication_attention.py")
     result = run(repo, sys.executable, script, input=json.dumps({"cwd": str(repo)}))
