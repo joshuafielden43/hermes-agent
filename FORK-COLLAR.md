@@ -69,16 +69,16 @@ Python files and verify `git diff --check`.
 
 ## Publish branch and image
 
-Push only to the `fork` remote. First publish the dated rollback branch, then
-fast-forward the fork's `main` to the verified candidate:
+Push only the dated branch to the `fork` remote:
 
 ```bash
 git push --set-upstream fork HEAD
-git push fork HEAD:main
 ```
 
-Never force-push `main`. If it is not a fast-forward, stop and reconcile the
-fork state explicitly. Never create an upstream pull request.
+The installed publishing policy protects `main` from both automatic and
+ordinary Git pushes. Promote a verified dated branch to fork `main` through a
+reviewed pull request in `joshuafielden43/hermes-agent`; never force-push it
+and never create an upstream pull request.
 
 The dated branch is only a rollback reference. Fast-forwarding fork `main`
 runs `.github/workflows/fork-collar-image.yml` in

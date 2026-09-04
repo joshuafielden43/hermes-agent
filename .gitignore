@@ -220,3 +220,37 @@ native/fts5_cjk/*.so
 
 # Disposable profile created by scripts/probe_active_session_exclusivity.py
 .probe-home/
+
+# ===== git-hardening secrets block (managed default — keep in sync) =====
+# Env files (templates stay tracked via the negations below)
+.env
+.env.*
+*.env
+!.env.example
+!.env.sample
+!.env.template
+!.env.dist
+# Auth / secret stores
+auth.json
+*.secret
+*secrets.json
+*secrets.yaml
+*secrets.yml
+# Private keys / certs
+id_rsa
+id_dsa
+id_ecdsa
+id_ed25519
+*.pem
+*.key
+*.p12
+*.pfx
+*.keystore
+*.jks
+# Credentials
+.netrc
+.htpasswd
+.pgpass
+credentials
+credentials.*
+# ===== end git-hardening secrets block =====

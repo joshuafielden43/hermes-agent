@@ -22,6 +22,8 @@ its exact-SHA receipt and hosted CI result are recorded in task 2089.
    Install only into this worktree's Git configuration, preserving other
    worktrees and refusing to replace unrelated hooks. Pin default pushes to
    `fork`; make origin/upstream read-only for this worktree.
+   Repository-specific ownership now lives in `.git-publishing.json`; the
+   installed runtime snapshots that policy with the reviewed publisher source.
 4. On commit, capture the immutable SHA and attached branch. Queue a detached
    publisher from that commit's source. Push `SHA:refs/heads/BRANCH`, never a
    later `HEAD`. A dirty checkout is neither staged nor committed by the hook.
@@ -56,6 +58,13 @@ Reinstallation also verifies the installed directory's content hashes; added or
 modified hooks require explicit integration, including changes to owned entries.
 The publisher does not auto-stage files, create commits, wake inactive agents,
 or send credentials to CI. Publishing is not deployment or production approval.
+
+The 2026-09-04 hardening refresh also scans every newly reachable outgoing blob
+and commit message, including secrets added and deleted before the branch tip.
+Coverage and object-size limits fail closed, and diagnostics report object IDs
+without echoing matched values. The policy protects `main`, so automatic and
+ordinary Git pushes cannot promote it; promotion must use the fork's reviewed
+pull-request path.
 
 ## CI implementation
 

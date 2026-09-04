@@ -15,6 +15,13 @@ import pytest
 PUBLISHER = Path(__file__).resolve().parents[2] / "scripts/fork_publish.py"
 DESTINATION = "git@github.com:joshuafielden43/hermes-agent.git"
 
+LEGACY_HOOK = """#!/usr/bin/env bash
+# Auto-push config commits. Backgrounded + quiet so it never blocks a commit.
+# Pushes the current branch to origin; silent on success, logs on failure.
+( git push origin HEAD >/dev/null 2>>"$(git rev-parse --show-toplevel)/.git/autopush.log" \\
+  || echo "$(date): autopush failed (see autopush.log)" >&2 ) &
+"""
+
 
 def run(repo, *args, input=None, check=True):
     return subprocess.run(
@@ -37,6 +44,9 @@ def repo(tmp_path, monkeypatch):
     run(tmp_path, "git", "config", "user.name", "Publisher Test")
     run(tmp_path, "git", "config", "user.email", "test@example.invalid")
     run(tmp_path, "git", "remote", "add", "fork", DESTINATION)
+    shutil.copyfile(
+        PUBLISHER.parents[1] / ".git-publishing.json", tmp_path / ".git-publishing.json"
+    )
     run(tmp_path, "git", "commit", "--allow-empty", "-m", "initial")
     return tmp_path
 
@@ -77,7 +87,7 @@ def test_installer_scopes_hooks_and_destinations_to_this_worktree(repo, tmp_path
     seed_publisher(repo)
     other = tmp_path / "sibling"
     run(repo, "git", "worktree", "add", "-b", "codex/other", str(other))
-    run(repo, "git", "remote", "add", "origin", "ssh://lab.invalid/source")
+    run(repo, "git", "remote", "add", "source", "ssh://lab.invalid/source")
     run(
         repo,
         "git",
@@ -92,11 +102,11 @@ def test_installer_scopes_hooks_and_destinations_to_this_worktree(repo, tmp_path
         run(repo, "git", "config", "--get", "remote.pushDefault").stdout.strip()
         == "fork"
     )
-    assert run(repo, "git", "remote", "get-url", "--push", "origin").stdout.startswith(
+    assert run(repo, "git", "remote", "get-url", "--push", "source").stdout.startswith(
         "disabled:"
     )
     assert (
-        run(other, "git", "remote", "get-url", "--push", "origin").stdout.strip()
+        run(other, "git", "remote", "get-url", "--push", "source").stdout.strip()
         == "ssh://lab.invalid/source"
     )
     assert (
@@ -191,7 +201,7 @@ def test_commit_pushes_captured_sha_and_branch_despite_checkout_change(
 
 def test_installer_preserves_unrelated_hooks(repo):
     seed_publisher(repo)
-    hook = repo / ".git/hooks/pre-commit"
+    hook = repo / ".git/hooks/pre-push"
     hook.write_text("#!/bin/sh\nexit 0\n")
     before = (repo / ".git/config").read_bytes()
     result = run(repo, sys.executable, str(PUBLISHER), "install", check=False)
@@ -314,6 +324,8 @@ def test_failed_push_keeps_commit_and_can_retry_same_receipt(repo, monkeypatch):
     assert receipt.get("pushed") is not True
     assert run(repo, "git", "rev-parse", "HEAD").stdout.strip() == sha
     monkeypatch.setenv("GIT_SSH_COMMAND", transport)
+    # Retry belongs to the original captured policy, not today's checkout.
+    (repo / ".git-publishing.json").write_text("{}")
     path = str(Path(receipt["log"]).with_name("receipt.json"))
     result = run(repo, sys.executable, str(PUBLISHER), "retry", path, check=False)
     assert result.returncode == 0, result.stderr
@@ -377,3 +389,198 @@ def test_ci_does_not_forget_observed_pending_sibling(repo, monkeypatch):
     receipt = wait_for_receipt(repo)
     assert receipt["state"] == "failed", receipt
     assert "disappeared" in receipt["error"]
+
+
+def test_installer_preserves_active_precommit_guard(repo):
+    seed_publisher(repo)
+    precommit = repo / ".git/hooks/pre-commit"
+    precommit.write_text("#!/bin/sh\necho existing-guard >&2\nexit 1\n")
+    precommit.chmod(0o700)
+    original = precommit.read_bytes()
+    result = run(repo, sys.executable, str(PUBLISHER), "install", check=False)
+    assert result.returncode == 0, result.stderr
+    blocked = run(
+        repo, "git", "commit", "--allow-empty", "-m", "must fail", check=False
+    )
+    assert blocked.returncode != 0
+    assert "existing-guard" in blocked.stderr
+    assert precommit.read_bytes() == original
+    # A clean reinstall must retain the forwarding wrapper, too.
+    run(repo, sys.executable, str(PUBLISHER), "install")
+    blocked = run(repo, "git", "hook", "run", "pre-commit", check=False)
+    assert blocked.returncode != 0
+    assert "existing-guard" in blocked.stderr
+
+
+@pytest.mark.parametrize("filename", [".env.example", "normal.txt", "normal.py"])
+def test_template_credentials_are_blocked_without_echo(repo, filename, monkeypatch):
+    token = "ghp_" + "A" * 36
+    (repo / filename).write_text("TOKEN=" + token)
+    run(repo, "git", "add", filename)
+    if filename.endswith(".py"):
+        fake_bin = repo / "fake-bin"
+        fake_bin.mkdir()
+        ruff = fake_bin / "ruff"
+        ruff.write_text('#!/bin/sh\necho "$FIXTURE_TOKEN"\nexit 1\n')
+        ruff.chmod(0o700)
+        monkeypatch.setenv("FIXTURE_TOKEN", token)
+        monkeypatch.setenv("PATH", str(fake_bin) + os.pathsep + os.environ["PATH"])
+    result = run(repo, "bash", str(PUBLISHER.parent / "pre-commit-guards"), check=False)
+    assert result.returncode != 0
+    assert token not in result.stdout + result.stderr
+    assert token[:20] not in result.stdout + result.stderr
+
+
+def test_policy_selects_owned_destination_and_protects_main(repo):
+    policy = {
+        "repository": "example-owner/example-project",
+        "remote": "backup",
+        "workflow": "checks",
+        "protected_branches": ["main", "master"],
+    }
+    (repo / ".git-publishing.json").write_text(json.dumps(policy))
+    url = "git@github.com:example-owner/example-project.git"
+    run(repo, "git", "remote", "add", "backup", url)
+    sha = run(repo, "git", "rev-parse", "HEAD").stdout.strip()
+    allowed = run(
+        repo,
+        sys.executable,
+        str(PUBLISHER),
+        "guard",
+        "backup",
+        url,
+        input=f"HEAD {sha} refs/heads/codex/work {'0' * 40}\n",
+        check=False,
+    )
+    assert allowed.returncode == 0, allowed.stderr
+    blocked = run(
+        repo,
+        sys.executable,
+        str(PUBLISHER),
+        "guard",
+        "backup",
+        url,
+        input=f"HEAD {sha} refs/heads/main {'0' * 40}\n",
+        check=False,
+    )
+    assert blocked.returncode != 0
+    assert "protected branch" in blocked.stderr
+
+
+def test_outgoing_scan_catches_secret_removed_by_later_commit(repo):
+    base = run(repo, "git", "rev-parse", "HEAD").stdout.strip()
+    token = "ghp_" + "B" * 36
+    (repo / ".env.example").write_text("TOKEN=" + token)
+    run(repo, "git", "add", ".env.example")
+    run(repo, "git", "commit", "-m", "imported history")
+    run(repo, "git", "rm", ".env.example")
+    run(repo, "git", "commit", "-m", "delete secret from tip")
+    sha = run(repo, "git", "rev-parse", "HEAD").stdout.strip()
+    result = run(
+        repo,
+        sys.executable,
+        str(PUBLISHER),
+        "guard",
+        "fork",
+        DESTINATION,
+        input=f"HEAD {sha} refs/heads/codex/test {base}\n",
+        check=False,
+    )
+    assert result.returncode != 0
+    assert "credential" in result.stderr
+    assert token[:20] not in result.stdout + result.stderr
+
+
+def test_session_attention_warns_on_failure_not_success(repo):
+    state = repo / ".git/fork-publish/job"
+    state.mkdir(parents=True)
+    receipt = {
+        "sha": "a" * 40,
+        "state": "failed",
+        "created": time.time(),
+        "error": "DO NOT ECHO ME",
+    }
+    (state / "receipt.json").write_text(json.dumps(receipt))
+    script = str(PUBLISHER.parent / "publication_attention.py")
+    payload = json.dumps({"cwd": str(repo), "session_id": "first"})
+    result = run(repo, sys.executable, script, input=payload, check=False)
+    assert result.returncode == 0, result.stderr
+    assert "failed" in result.stdout and "DO NOT ECHO ME" not in result.stdout
+    assert run(repo, sys.executable, script, input=payload).stdout == ""
+    receipt["state"] = "passed"
+    (state / "receipt.json").write_text(json.dumps(receipt))
+    assert (
+        run(
+            repo,
+            sys.executable,
+            script,
+            input=json.dumps({"cwd": str(repo), "session_id": "second"}),
+        ).stdout
+        == ""
+    )
+
+
+def test_missing_policy_fails_closed(repo):
+    (repo / ".git-publishing.json").unlink()
+    result = run(repo, sys.executable, str(PUBLISHER), "install", check=False)
+    assert result.returncode != 0
+
+
+def test_installed_policy_ignores_later_checkout_policy(repo, monkeypatch):
+    seed_publisher(repo)
+    fake_services(repo, monkeypatch)
+    run(repo, sys.executable, str(PUBLISHER), "install")
+    (repo / ".git-publishing.json").write_text("{}")
+    run(repo, "git", "commit", "--allow-empty", "-m", "installed policy stays pinned")
+    # Also exercise the installed public CLI after the checkout policy changes.
+    hooks = Path(run(repo, "git", "config", "--get", "core.hooksPath").stdout.strip())
+    deadline = time.monotonic() + 20
+    while time.monotonic() < deadline:
+        receipts = json.loads(
+            run(repo, sys.executable, str(hooks / "fork_publish.py"), "status").stdout
+        )
+        if receipts and receipts[-1]["state"] in {"passed", "failed"}:
+            assert receipts[-1]["state"] == "passed", receipts
+            return
+        time.sleep(0.2)
+    pytest.fail("Installed worker did not finish")
+
+
+def test_session_attention_reports_interrupted_worker(repo):
+    state = repo / ".git/fork-publish/job"
+    state.mkdir(parents=True)
+    (state / "receipt.json").write_text(
+        json.dumps(
+            {"sha": "b" * 40, "state": "watching", "created": time.time() - 4000}
+        )
+    )
+    script = str(PUBLISHER.parent / "publication_attention.py")
+    result = run(repo, sys.executable, script, input=json.dumps({"cwd": str(repo)}))
+    assert "interrupted or overdue" in result.stdout
+
+
+def test_missing_installed_policy_never_falls_back_to_checkout(repo, monkeypatch):
+    seed_publisher(repo)
+    fake_services(repo, monkeypatch)
+    monkeypatch.setenv("GIT_SSH_COMMAND", "false")
+    run(repo, sys.executable, str(PUBLISHER), "install")
+    run(repo, sys.executable, str(PUBLISHER), "queue")
+    receipt = wait_for_receipt(repo)
+    assert receipt["state"] == "failed"
+    path = Path(receipt["log"]).with_name("receipt.json")
+    (path.parent / "publishing-policy.json").unlink()
+    result = run(repo, sys.executable, str(PUBLISHER), "retry", str(path), check=False)
+    assert result.returncode != 0
+    assert "snapshot" in result.stderr
+    result = run(
+        repo,
+        sys.executable,
+        str(path.parent / "fork_publish.py"),
+        "guard",
+        "fork",
+        DESTINATION,
+        input="",
+        check=False,
+    )
+    assert result.returncode != 0
+    assert "policy" in result.stderr
